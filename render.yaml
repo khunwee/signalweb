@@ -1,9 +1,13 @@
 services:
   - type: web
-    name: signal-dashboard
+    name: signalweb
     runtime: python
     buildCommand: pip install -r requirements.txt
-    startCommand: gunicorn -k eventlet -w 1 --bind 0.0.0.0:$PORT app:app
+    startCommand: python app.py
     envVars:
+      - key: PORT
+        value: 8000
+      - key: SECRET_KEY
+        generateValue: true
       - key: PYTHON_VERSION
-        value: 3.11.0
+        value: 3.11.11
