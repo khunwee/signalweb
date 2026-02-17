@@ -1,13 +1,20 @@
 """
-⚡ UTS Pro v4.0 - Fixed Version with Better Error Handling
+Ultimate Trading System Pro v4 - Web Dashboard (FIXED)
+Based on Pine Script UTS Pro v4.0 Indicator
+Fixes: Real-time data fetching, proper error handling, fallback providers,
+       eventlet monkey-patching, session logic, socket emission
 """
-from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, flash
+
+# CRITICAL: Must monkey-patch BEFORE all other imports
+import eventlet
+eventlet.monkey_patch()
+
+from flask import Flask, render_template_string, request, redirect, url_for, session, flash
 from flask_socketio import SocketIO, emit
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Dict, List, Tuple
 from dataclasses import dataclass, asdict, field
 from functools import wraps
-from enum import Enum
 import pandas as pd
 import numpy as np
 import threading
@@ -17,17 +24,29 @@ import time
 import json
 import os
 import traceback
+import logging
+
+# Setup logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+logger = logging.getLogger('UTS')
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
 app.config['PERMANENT_SESSION_LIFETIME'] = timedelta(days=7)
-socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet')
+socketio = SocketIO(app, cors_allowed_origins="*", async_mode='eventlet', 
+                    ping_timeout=60, ping_interval=25)
 
+# Bangkok timezone (UTC+7)
 BANGKOK_TZ = timezone(timedelta(hours=7))
 
-def get_bangkok_time(): return datetime.now(BANGKOK_TZ)
-def format_bangkok_time(fmt="%H:%M:%S"): return get_bangkok_time().strftime(fmt)
-def format_bangkok_datetime(fmt="%Y-%m-%d %H:%M:%S"): return get_bangkok_time().strftime(fmt)
+def get_bangkok_time():
+    return datetime.now(BANGKOK_TZ)
+
+def format_time(fmt="%H:%M:%S"):
+    return get_bangkok_time().strftime(fmt)
+
+def format_datetime(fmt="%Y-%m-%d %H:%M:%S"):
+    return get_bangkok_time().strftime(fmt)
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # CONFIGURATION
@@ -37,61 +56,69 @@ class Config:
     PIVOT_LOOKBACK = 10
     ZONE_LOOKBACK = 100
     SWING_STRENGTH = 5
-    SIGNAL_MODE = "Combined"
-    SIGNAL_SENSITIVITY = 2
-    MIN_CONFLUENCE_SCORE = 3
+    
+    MIN_CONFLUENCE_SCORE = 5
+    MIN_RR_RATIO = 1.5
+    SIGNAL_EXPIRY_BARS = 30
     SR_CONFLUENCE_BOOST = 2
-    AUTO_ZONE_ENABLED = True
-    ZONE_THICKNESS_PIPS = 30
-    MM_ENABLED = True
-    MM_MULTIPLIER = 1.5
-    MM_BODY_RATIO = 0.6
-    REV_WICK_RATIO = 0.6
-    REV_LOOKBACK = 3
-    USE_TREND_FILTER = True
-    EMA_PERIOD = 50
-    USE_VOLUME_FILTER = False  # Disabled - volume data unreliable
-    VOLUME_PERIOD = 20
-    VOLUME_MULTIPLIER = 1.2
-    USE_RSI_FILTER = True
-    RSI_PERIOD = 14
-    RSI_OB = 70
-    RSI_OS = 30
-    USE_ADX = True
-    ADX_PERIOD = 14
-    ADX_THRESHOLD = 25
-    USE_ATR_STOPS = True
+    
     ATR_STOP_MULT = 1.5
     RR_RATIO = 2.0
-    MIN_RR = 1.5
-    ACCOUNT_SIZE = 10000
-    RISK_PERCENT = 1.0
-    PIVOT_ENABLED = True
-    FIB_ENABLED = True
-    FIB_LOOKBACK = 100
+    MAX_RISK_DOLLARS = 15.0
+    
+    MM_CANDLE_SIZE_ATR = 1.5
+    MM_BODY_RATIO = 0.6
+    REV_WICK_RATIO = 0.6
+    
+    FVG_MIN_SIZE_ATR = 0.5
+    MAX_FVG = 10
+    
+    RSI_PERIOD = 14
+    RSI_OVERBOUGHT = 70
+    RSI_OVERSOLD = 30
+    ADX_PERIOD = 14
+    ADX_THRESHOLD = 25
+    EMA_PERIOD = 50
+    
+    SCAN_INTERVAL = 30  # seconds between full scans
     
     SYMBOLS = {
-        "XAUUSD": {"name": "Gold", "emoji": "🥇", "yf": "GC=F"},
-        "XAGUSD": {"name": "Silver", "emoji": "🥈", "yf": "SI=F"},
-        "USOUSD": {"name": "Oil", "emoji": "🛢️", "yf": "CL=F"},
+        "XAUUSD": {"yf": "GC=F", "name": "Gold", "emoji": "🥇", "decimals": 2},
+        "XAGUSD": {"yf": "SI=F", "name": "Silver", "emoji": "🥈", "decimals": 3},
+        "USOUSD": {"yf": "CL=F", "name": "Oil", "emoji": "🛢️", "decimals": 2},
     }
-    
-    SCAN_INTERVAL = 60  # Increased to avoid rate limiting
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENUMS & DATA CLASSES
+# DATA STRUCTURES
 # ═══════════════════════════════════════════════════════════════════════════════
-class CandleType(Enum):
-    NONE = 0
-    MM_BULL = 1
-    MM_BEAR = 2
-    REV_BULL = 3
-    REV_BEAR = 4
+@dataclass
+class SRLevel:
+    price: float
+    name: str
+    level_type: str
+    strength: int
 
-class MarketStructure(Enum):
-    RANGING = 0
-    BULLISH = 1
-    BEARISH = -1
+@dataclass
+class Zone:
+    top: float
+    bottom: float
+    zone_type: str
+    strength: int
+    fresh: bool
+
+@dataclass
+class FVG:
+    top: float
+    bottom: float
+    bullish: bool
+    mitigated: bool
+
+@dataclass
+class OrderBlock:
+    top: float
+    bottom: float
+    bullish: bool
+    mitigated: bool
 
 @dataclass
 class Signal:
@@ -105,373 +132,74 @@ class Signal:
     tp2: float
     tp3: float
     risk_dollars: float
-    reward_tp1: float
-    reward_tp2: float
-    reward_tp3: float
     risk_reward: float
     confluence_score: int
+    confluence_details: Dict
     reasons: List[str]
-    session: str
+    session_name: str
     market_structure: str
-    zone_status: str
-    sr_cluster: int
+    premium_discount: str
+    sr_levels_near: int
     timestamp: str
     timestamp_unix: float
-    candle_type: str = "NONE"
-    bos_choch: str = ""
-    premium_discount: str = ""
-    adx_value: float = 0
-    rsi_value: float = 0
-    atr_value: float = 0
-    position_size: float = 0
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TECHNICAL INDICATORS
-# ═══════════════════════════════════════════════════════════════════════════════
-class Indicators:
-    @staticmethod
-    def ema(s, p): 
-        return s.ewm(span=p, adjust=False).mean()
-    
-    @staticmethod
-    def sma(s, p): 
-        return s.rolling(window=p).mean()
-    
-    @staticmethod
-    def rsi(s, p=14):
-        d = s.diff()
-        g = d.where(d > 0, 0).rolling(p).mean()
-        l = (-d.where(d < 0, 0)).rolling(p).mean()
-        return 100 - (100 / (1 + g / (l + 0.0001)))
-    
-    @staticmethod
-    def atr(h, l, c, p=14):
-        tr = pd.concat([h-l, abs(h-c.shift(1)), abs(l-c.shift(1))], axis=1).max(axis=1)
-        return tr.rolling(p).mean()
-    
-    @staticmethod
-    def adx(h, l, c, p=14):
-        plus_dm = h.diff().where(lambda x: x > 0, 0)
-        minus_dm = (-l.diff()).where(lambda x: x > 0, 0)
-        tr = Indicators.atr(h, l, c, 1) * p
-        plus_di = 100 * (plus_dm.rolling(p).mean() / (tr + 0.0001))
-        minus_di = 100 * (minus_dm.rolling(p).mean() / (tr + 0.0001))
-        dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di + 0.0001)
-        return plus_di, minus_di, dx.rolling(p).mean()
+@dataclass
+class MarketAnalysis:
+    symbol: str
+    price: float
+    prev_close: float
+    change: float
+    change_pct: float
+    atr: float
+    rsi: float
+    adx: float
+    ema50: float
+    ema200: float
+    market_structure: str
+    trend: str
+    premium_discount: str
+    in_kill_zone: bool
+    session_name: str
+    buy_confluence: int
+    sell_confluence: int
+    sr_levels: List[SRLevel]
+    supply_zones: List[Zone]
+    demand_zones: List[Zone]
+    fvgs: List[FVG]
+    order_blocks: List[OrderBlock]
+    swing_high: float
+    swing_low: float
+    daily_high: float
+    daily_low: float
+    weekly_high: float
+    weekly_low: float
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# DATA FETCHER - IMPROVED WITH BETTER ERROR HANDLING
-# ═══════════════════════════════════════════════════════════════════════════════
-class DataFetcher:
-    _cache = {}
-    _cache_time = {}
-    CACHE_DURATION = 30  # Cache for 30 seconds
-    
-    @staticmethod
-    def get_current_price(symbol: str) -> Optional[Dict]:
-        """Fetch current price with caching and better error handling"""
-        cache_key = f"price_{symbol}"
-        now = time.time()
-        
-        # Check cache
-        if cache_key in DataFetcher._cache:
-            if now - DataFetcher._cache_time.get(cache_key, 0) < DataFetcher.CACHE_DURATION:
-                cached = DataFetcher._cache[cache_key].copy()
-                cached['time'] = format_bangkok_time()
-                cached['cached'] = True
-                return cached
-        
-        try:
-            import yfinance as yf
-            yf_sym = Config.SYMBOLS.get(symbol, {}).get('yf', 'GC=F')
-            
-            print(f"[{format_bangkok_time()}] Fetching price for {symbol} ({yf_sym})...")
-            
-            ticker = yf.Ticker(yf_sym)
-            
-            # Try 1-minute data first
-            hist = ticker.history(period="1d", interval="1m")
-            
-            # Fallback to 5-minute if 1-minute is empty
-            if hist.empty:
-                print(f"[{format_bangkok_time()}] 1m data empty, trying 5m...")
-                hist = ticker.history(period="2d", interval="5m")
-            
-            # Fallback to 15-minute
-            if hist.empty:
-                print(f"[{format_bangkok_time()}] 5m data empty, trying 15m...")
-                hist = ticker.history(period="5d", interval="15m")
-            
-            # Final fallback to daily
-            if hist.empty:
-                print(f"[{format_bangkok_time()}] 15m data empty, trying daily...")
-                hist = ticker.history(period="1mo", interval="1d")
-            
-            if hist.empty:
-                print(f"[{format_bangkok_time()}] ❌ No data for {symbol}")
-                return None
-            
-            print(f"[{format_bangkok_time()}] ✅ Got {len(hist)} bars for {symbol}")
-            
-            latest = hist.iloc[-1]
-            prev = hist.iloc[-2] if len(hist) > 1 else latest
-            chg = float(latest["Close"]) - float(prev["Close"])
-            
-            result = {
-                "symbol": symbol,
-                "price": round(float(latest["Close"]), 2),
-                "high": round(float(hist["High"].max()), 2),
-                "low": round(float(hist["Low"].min()), 2),
-                "change": round(chg, 2),
-                "change_pct": round((chg / float(prev["Close"])) * 100, 3) if prev["Close"] != 0 else 0,
-                "time": format_bangkok_time(),
-                "bars": len(hist),
-                "cached": False
-            }
-            
-            # Update cache
-            DataFetcher._cache[cache_key] = result
-            DataFetcher._cache_time[cache_key] = now
-            
-            return result
-            
-        except Exception as e:
-            print(f"[{format_bangkok_time()}] ❌ Price error {symbol}: {e}")
-            traceback.print_exc()
-            return None
-    
-    @staticmethod
-    def fetch_candles(symbol: str, interval: str = "15m", period: str = "5d") -> Optional[pd.DataFrame]:
-        """Fetch candle data with caching"""
-        cache_key = f"candles_{symbol}_{interval}_{period}"
-        now = time.time()
-        
-        # Check cache (longer duration for candles)
-        if cache_key in DataFetcher._cache:
-            if now - DataFetcher._cache_time.get(cache_key, 0) < 60:  # 60 second cache
-                return DataFetcher._cache[cache_key].copy()
-        
-        try:
-            import yfinance as yf
-            yf_sym = Config.SYMBOLS.get(symbol, {}).get('yf', 'GC=F')
-            
-            print(f"[{format_bangkok_time()}] Fetching candles for {symbol} ({interval}, {period})...")
-            
-            df = yf.Ticker(yf_sym).history(period=period, interval=interval)
-            
-            if df.empty:
-                print(f"[{format_bangkok_time()}] ❌ Empty candles for {symbol}")
-                return None
-            
-            df.columns = [c.lower() for c in df.columns]
-            
-            print(f"[{format_bangkok_time()}] ✅ Got {len(df)} candles for {symbol}")
-            
-            # Update cache
-            DataFetcher._cache[cache_key] = df.copy()
-            DataFetcher._cache_time[cache_key] = now
-            
-            return df
-            
-        except Exception as e:
-            print(f"[{format_bangkok_time()}] ❌ Candle error {symbol}: {e}")
-            traceback.print_exc()
-            return None
-
-fetcher = DataFetcher()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SESSION DETECTOR
-# ═══════════════════════════════════════════════════════════════════════════════
-class SessionDetector:
-    @staticmethod
-    def get_current_session():
-        h = datetime.utcnow().hour
-        in_kill = (8 <= h < 10) or (14 <= h < 16)
-        
-        if 8 <= h < 10:
-            name = "LONDON-KZ ⭐⭐"
-        elif 14 <= h < 16:
-            name = "NY-KZ ⭐⭐"
-        elif 8 <= h < 16 and 13 <= h:
-            name = "LONDON-NY ⭐⭐"
-        elif 8 <= h < 16:
-            name = "LONDON ⭐"
-        elif 13 <= h < 22:
-            name = "NEW YORK"
-        elif h < 9:
-            name = "ASIAN"
-        else:
-            name = "OFF-PEAK"
-            
-        return {'name': name, 'in_kill_zone': in_kill, 'score': 15 if in_kill else 10 if "LONDON" in name else 5}
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SIMPLIFIED SIGNAL GENERATOR
-# ═══════════════════════════════════════════════════════════════════════════════
-class SignalGenerator:
-    def generate_signal(self, symbol: str) -> Optional[Signal]:
-        try:
-            # Fetch data
-            df = fetcher.fetch_candles(symbol, "15m", "5d")
-            
-            if df is None or len(df) < 50:
-                print(f"[{format_bangkok_time()}] Not enough data for {symbol}: {len(df) if df is not None else 0} bars")
-                return None
-            
-            # Calculate indicators
-            df['ema9'] = Indicators.ema(df['close'], 9)
-            df['ema21'] = Indicators.ema(df['close'], 21)
-            df['ema50'] = Indicators.ema(df['close'], 50)
-            df['ema200'] = Indicators.ema(df['close'], 200)
-            df['rsi'] = Indicators.rsi(df['close'], Config.RSI_PERIOD)
-            df['atr'] = Indicators.atr(df['high'], df['low'], df['close'], Config.ATR_PERIOD)
-            df['di_plus'], df['di_minus'], df['adx'] = Indicators.adx(df['high'], df['low'], df['close'], Config.ADX_PERIOD)
-            
-            lat = df.iloc[-1]
-            prev = df.iloc[-2]
-            
-            # Get session
-            session = SessionDetector.get_current_session()
-            
-            # Determine trend direction
-            price = lat['close']
-            direction = None
-            score = 0
-            reasons = []
-            
-            # EMA Trend Check
-            if lat['ema9'] > lat['ema21'] > lat['ema50']:
-                direction = "BUY"
-                score += 3
-                reasons.append("✅ EMA Bullish")
-            elif lat['ema9'] < lat['ema21'] < lat['ema50']:
-                direction = "SELL"
-                score += 3
-                reasons.append("✅ EMA Bearish")
-            else:
-                # No clear trend
-                return None
-            
-            # RSI Check
-            rsi = lat['rsi']
-            if not pd.isna(rsi):
-                if direction == "BUY" and 30 <= rsi <= 60:
-                    score += 2
-                    reasons.append(f"✅ RSI {rsi:.0f}")
-                elif direction == "SELL" and 40 <= rsi <= 70:
-                    score += 2
-                    reasons.append(f"✅ RSI {rsi:.0f}")
-            
-            # ADX Check
-            adx = lat['adx']
-            if not pd.isna(adx) and adx > Config.ADX_THRESHOLD:
-                score += 2
-                reasons.append(f"✅ ADX {adx:.0f}")
-            
-            # Session bonus
-            if session['in_kill_zone']:
-                score += 1
-                reasons.append(f"✅ {session['name']}")
-            
-            # Price above/below EMA200
-            if direction == "BUY" and price > lat['ema200']:
-                score += 1
-                reasons.append("✅ Above EMA200")
-            elif direction == "SELL" and price < lat['ema200']:
-                score += 1
-                reasons.append("✅ Below EMA200")
-            
-            # Minimum score check
-            if score < Config.MIN_CONFLUENCE_SCORE:
-                print(f"[{format_bangkok_time()}] {symbol} score too low: {score}")
-                return None
-            
-            # Calculate entry levels
-            entry = round(price, 2)
-            atr_val = lat['atr'] if not pd.isna(lat['atr']) else 1.0
-            
-            if direction == "BUY":
-                sl = round(entry - atr_val * Config.ATR_STOP_MULT, 2)
-                risk = entry - sl
-                tp1 = round(entry + risk * 1.5, 2)
-                tp2 = round(entry + risk * 2.5, 2)
-                tp3 = round(entry + risk * 4.0, 2)
-            else:
-                sl = round(entry + atr_val * Config.ATR_STOP_MULT, 2)
-                risk = sl - entry
-                tp1 = round(entry - risk * 1.5, 2)
-                tp2 = round(entry - risk * 2.5, 2)
-                tp3 = round(entry - risk * 4.0, 2)
-            
-            # R:R Check
-            rr = abs(tp2 - entry) / risk if risk > 0 else 0
-            if rr < Config.MIN_RR:
-                return None
-            
-            # Create signal
-            strength = "🔥 STRONG" if score >= 8 else "⭐ GOOD" if score >= 5 else "📊 MODERATE"
-            
-            # Market structure
-            if lat['ema50'] > lat['ema200']:
-                market_struct = "BULLISH"
-            elif lat['ema50'] < lat['ema200']:
-                market_struct = "BEARISH"
-            else:
-                market_struct = "RANGING"
-            
-            return Signal(
-                signal_id=f"{symbol}_{direction}_{get_bangkok_time().strftime('%H%M%S')}",
-                symbol=symbol,
-                direction=direction,
-                strength=strength,
-                entry_price=entry,
-                stop_loss=sl,
-                tp1=tp1, tp2=tp2, tp3=tp3,
-                risk_dollars=round(risk, 2),
-                reward_tp1=round(abs(tp1-entry), 2),
-                reward_tp2=round(abs(tp2-entry), 2),
-                reward_tp3=round(abs(tp3-entry), 2),
-                risk_reward=round(rr, 2),
-                confluence_score=score,
-                reasons=reasons,
-                session=session['name'],
-                market_structure=market_struct,
-                zone_status="NEUTRAL",
-                sr_cluster=0,
-                timestamp=format_bangkok_datetime(),
-                timestamp_unix=time.time(),
-                adx_value=round(adx, 1) if not pd.isna(adx) else 0,
-                rsi_value=round(rsi, 1) if not pd.isna(rsi) else 50,
-                atr_value=round(atr_val, 2),
-                position_size=round((Config.ACCOUNT_SIZE * Config.RISK_PERCENT / 100) / risk, 2) if risk > 0 else 0
-            )
-            
-        except Exception as e:
-            print(f"[{format_bangkok_time()}] ❌ Signal generation error for {symbol}: {e}")
-            traceback.print_exc()
-            return None
-
-generator = SignalGenerator()
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# STORE & AUTH
-# ═══════════════════════════════════════════════════════════════════════════════
 class Store:
     def __init__(self):
-        self.prices = {}
-        self.signals = {}
-        self.history = []
+        self.prices: Dict[str, Dict] = {}
+        self.signals: Dict[str, Signal] = {}
+        self.analysis: Dict[str, MarketAnalysis] = {}
+        self.history: List[Signal] = []
         self.last_scan = "Never"
         self.scan_count = 0
         self.connected_clients = 0
-        self.online_users = {}
-        self.total_buy_signals = 0
-        self.total_sell_signals = 0
-        self.errors = []
+        self.errors: List[str] = []
+        self.scanner_status = "STARTING"
+        self.stats = {
+            'total_buy': 0, 'total_sell': 0,
+            'buy_wins': 0, 'buy_losses': 0,
+            'sell_wins': 0, 'sell_losses': 0
+        }
+    
+    def add_error(self, msg):
+        self.errors.insert(0, f"[{format_time()}] {msg}")
+        self.errors = self.errors[:50]
 
 store = Store()
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# USER AUTHENTICATION
+# ═══════════════════════════════════════════════════════════════════════════════
 class UserManager:
     def __init__(self):
         self.users_file = 'users.json'
@@ -482,16 +210,13 @@ class UserManager:
             if os.path.exists(self.users_file):
                 with open(self.users_file, 'r') as f:
                     return json.load(f)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to load users: {e}")
         default = {
             'admin': {
                 'password': self.hash_password('admin123'),
-                'role': 'admin',
-                'name': 'Administrator',
-                'created': format_bangkok_datetime(),
-                'active': True,
-                'last_login': None
+                'role': 'admin', 'name': 'Administrator',
+                'created': format_datetime(), 'active': True, 'last_login': None
             }
         }
         self.save_users(default)
@@ -501,329 +226,1812 @@ class UserManager:
         try:
             with open(self.users_file, 'w') as f:
                 json.dump(users or self.users, f, indent=2)
-        except:
-            pass
+        except Exception as e:
+            logger.error(f"Failed to save users: {e}")
     
-    def hash_password(self, p):
-        return hashlib.sha256(f"{p}uts_pro_2024".encode()).hexdigest()
+    def hash_password(self, password):
+        return hashlib.sha256(f"{password}uts_pro_2024".encode()).hexdigest()
     
-    def verify_password(self, u, p):
-        return u in self.users and self.users[u].get('active', True) and self.users[u]['password'] == self.hash_password(p)
+    def verify(self, username, password):
+        if username not in self.users:
+            return False
+        user = self.users[username]
+        return user.get('active', True) and user['password'] == self.hash_password(password)
     
-    def create_user(self, u, p, n, r='user'):
-        if u in self.users:
-            return False, "Username exists"
-        self.users[u] = {
-            'password': self.hash_password(p),
-            'role': r,
-            'name': n,
-            'created': format_bangkok_datetime(),
-            'active': True,
-            'last_login': None
+    def create_user(self, username, password, name, role='user'):
+        if username in self.users:
+            return False, "User exists"
+        if len(password) < 6:
+            return False, "Password too short (min 6)"
+        self.users[username] = {
+            'password': self.hash_password(password), 'role': role, 'name': name,
+            'created': format_datetime(), 'active': True, 'last_login': None
         }
         self.save_users()
         return True, "Created"
     
-    def update_user(self, u, d):
-        if u not in self.users:
-            return False, "Not found"
-        if 'password' in d and d['password']:
-            self.users[u]['password'] = self.hash_password(d['password'])
-        for k in ['name', 'role', 'active']:
-            if k in d:
-                self.users[u][k] = d[k]
-        self.save_users()
-        return True, "Updated"
-    
-    def delete_user(self, u):
-        if u == 'admin':
-            return False, "Cannot delete admin"
-        if u in self.users:
-            del self.users[u]
-            self.save_users()
-            return True, "Deleted"
-        return False, "Not found"
-    
-    def get_user(self, u):
-        return self.users.get(u)
-    
     def get_all_users(self):
         return {u: {k: v for k, v in d.items() if k != 'password'} for u, d in self.users.items()}
-    
-    def update_last_login(self, u):
-        if u in self.users:
-            self.users[u]['last_login'] = format_bangkok_datetime()
-            self.save_users()
 
 user_manager = UserManager()
 
 def login_required(f):
     @wraps(f)
-    def decorated(*a, **kw):
+    def decorated(*args, **kwargs):
         if 'user' not in session:
             return redirect(url_for('login'))
-        return f(*a, **kw)
+        return f(*args, **kwargs)
     return decorated
 
 def admin_required(f):
     @wraps(f)
-    def decorated(*a, **kw):
+    def decorated(*args, **kwargs):
         if 'user' not in session:
             return redirect(url_for('login'))
-        u = user_manager.get_user(session['user'])
-        if not u or u.get('role') != 'admin':
-            flash('Admin required', 'error')
+        user = user_manager.users.get(session['user'], {})
+        if user.get('role') != 'admin':
             return redirect(url_for('dashboard'))
-        return f(*a, **kw)
+        return f(*args, **kwargs)
     return decorated
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# BACKGROUND SCANNER - IMPROVED
+# DATA FETCHER - Multiple providers with fallback
 # ═══════════════════════════════════════════════════════════════════════════════
-scanner_running = False
+class DataFetcher:
+    """Fetch OHLCV data with multiple fallback methods"""
+    
+    def __init__(self):
+        self._cache = {}
+        self._cache_time = {}
+        self._cache_ttl = 15  # seconds
+    
+    def _cache_key(self, symbol, interval, period):
+        return f"{symbol}_{interval}_{period}"
+    
+    def _is_cached(self, key):
+        if key in self._cache and key in self._cache_time:
+            if time.time() - self._cache_time[key] < self._cache_ttl:
+                return True
+        return False
+    
+    def fetch(self, symbol: str, interval: str = "15m", period: str = "5d") -> Optional[pd.DataFrame]:
+        """Fetch data with caching and fallback"""
+        cache_key = self._cache_key(symbol, interval, period)
+        
+        if self._is_cached(cache_key):
+            return self._cache[cache_key]
+        
+        df = None
+        
+        # Method 1: yfinance
+        df = self._fetch_yfinance(symbol, interval, period)
+        
+        # Method 2: yfinance with different params
+        if df is None or df.empty:
+            df = self._fetch_yfinance_alt(symbol, interval, period)
+        
+        if df is not None and not df.empty:
+            self._cache[cache_key] = df
+            self._cache_time[cache_key] = time.time()
+            return df
+        
+        # Return last cached even if expired
+        if cache_key in self._cache:
+            logger.warning(f"Using stale cache for {symbol} {interval}")
+            return self._cache[cache_key]
+        
+        return None
+    
+    def _fetch_yfinance(self, symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
+        try:
+            import yfinance as yf
+            yf_symbol = Config.SYMBOLS.get(symbol, {}).get("yf", symbol)
+            ticker = yf.Ticker(yf_symbol)
+            df = ticker.history(period=period, interval=interval, prepost=True)
+            
+            if df is not None and not df.empty:
+                df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                # Ensure required columns exist
+                required = ['open', 'high', 'low', 'close', 'volume']
+                for col in required:
+                    if col not in df.columns:
+                        logger.warning(f"Missing column {col} for {symbol}")
+                        return None
+                # Drop any NaN rows in OHLC
+                df = df.dropna(subset=['open', 'high', 'low', 'close'])
+                if len(df) > 0:
+                    logger.info(f"✅ yfinance OK: {symbol} {interval} -> {len(df)} bars")
+                    return df
+                    
+        except Exception as e:
+            logger.warning(f"yfinance error {symbol} {interval}: {e}")
+        return None
+    
+    def _fetch_yfinance_alt(self, symbol: str, interval: str, period: str) -> Optional[pd.DataFrame]:
+        """Alternative yfinance fetch with adjusted parameters"""
+        try:
+            import yfinance as yf
+            yf_symbol = Config.SYMBOLS.get(symbol, {}).get("yf", symbol)
+            
+            # Try with longer period if short period fails
+            alt_periods = {
+                "5d": "1mo",
+                "1mo": "3mo", 
+                "3mo": "6mo",
+                "6mo": "1y"
+            }
+            alt_period = alt_periods.get(period, period)
+            
+            df = yf.download(yf_symbol, period=alt_period, interval=interval, 
+                           progress=False, show_errors=False)
+            
+            if df is not None and not df.empty:
+                df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                # Handle multi-level columns from yf.download
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = [c[0].lower() for c in df.columns]
+                
+                df = df.dropna(subset=['open', 'high', 'low', 'close'])
+                if len(df) > 0:
+                    logger.info(f"✅ yfinance alt OK: {symbol} {interval} -> {len(df)} bars")
+                    return df
+        except Exception as e:
+            logger.warning(f"yfinance alt error {symbol}: {e}")
+        return None
 
+data_fetcher = DataFetcher()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TECHNICAL ANALYSIS ENGINE
+# ═══════════════════════════════════════════════════════════════════════════════
+class UTSProAnalyzer:
+    
+    def calculate_atr(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        high, low, close = df['high'], df['low'], df['close'].shift(1)
+        tr = pd.concat([high - low, (high - close).abs(), (low - close).abs()], axis=1).max(axis=1)
+        return tr.rolling(period, min_periods=1).mean()
+    
+    def calculate_rsi(self, df: pd.DataFrame, period: int = 14) -> pd.Series:
+        delta = df['close'].diff()
+        gain = delta.where(delta > 0, 0.0).rolling(period, min_periods=1).mean()
+        loss = (-delta.where(delta < 0, 0.0)).rolling(period, min_periods=1).mean()
+        rs = gain / (loss + 1e-10)
+        return 100 - (100 / (1 + rs))
+    
+    def calculate_adx(self, df: pd.DataFrame, period: int = 14) -> Tuple[pd.Series, pd.Series, pd.Series]:
+        high, low = df['high'], df['low']
+        close_prev = df['close'].shift(1)
+        
+        tr = pd.concat([high - low, (high - close_prev).abs(), (low - close_prev).abs()], axis=1).max(axis=1)
+        atr = tr.rolling(period, min_periods=1).mean()
+        
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = (-low.diff()).clip(lower=0)
+        
+        plus_di = 100 * (plus_dm.rolling(period, min_periods=1).mean() / (atr + 1e-10))
+        minus_di = 100 * (minus_dm.rolling(period, min_periods=1).mean() / (atr + 1e-10))
+        
+        dx = 100 * ((plus_di - minus_di).abs() / (plus_di + minus_di + 1e-10))
+        adx = dx.rolling(period, min_periods=1).mean()
+        
+        return adx, plus_di, minus_di
+    
+    def calculate_ema(self, df: pd.DataFrame, period: int) -> pd.Series:
+        return df['close'].ewm(span=period, adjust=False, min_periods=1).mean()
+    
+    def find_swing_points(self, df: pd.DataFrame, strength: int = 5) -> Tuple[List[float], List[float]]:
+        swing_highs, swing_lows = [], []
+        n = len(df)
+        
+        if n < strength * 2 + 1:
+            # Fallback: use simple max/min
+            if n > 2:
+                swing_highs = [df['high'].max()]
+                swing_lows = [df['low'].min()]
+            return swing_highs, swing_lows
+        
+        for i in range(strength, n - strength):
+            is_high = all(df['high'].iloc[i] > df['high'].iloc[i - j] and 
+                         df['high'].iloc[i] > df['high'].iloc[i + j] 
+                         for j in range(1, strength + 1))
+            if is_high:
+                swing_highs.append(df['high'].iloc[i])
+            
+            is_low = all(df['low'].iloc[i] < df['low'].iloc[i - j] and 
+                        df['low'].iloc[i] < df['low'].iloc[i + j] 
+                        for j in range(1, strength + 1))
+            if is_low:
+                swing_lows.append(df['low'].iloc[i])
+        
+        # Ensure we always have at least one swing point
+        if not swing_highs:
+            swing_highs = [df['high'].iloc[-20:].max() if n >= 20 else df['high'].max()]
+        if not swing_lows:
+            swing_lows = [df['low'].iloc[-20:].min() if n >= 20 else df['low'].min()]
+        
+        return swing_highs, swing_lows
+    
+    def detect_market_structure(self, swing_highs: List[float], swing_lows: List[float]) -> str:
+        if len(swing_highs) < 2 or len(swing_lows) < 2:
+            return "RANGING"
+        
+        hh = swing_highs[-1] > swing_highs[-2]
+        hl = swing_lows[-1] > swing_lows[-2]
+        lh = swing_highs[-1] < swing_highs[-2]
+        ll = swing_lows[-1] < swing_lows[-2]
+        
+        if hh and hl:
+            return "BULLISH"
+        elif lh and ll:
+            return "BEARISH"
+        return "RANGING"
+    
+    def detect_bos_choch(self, df, swing_highs, swing_lows, market_structure):
+        if len(df) < 2 or not swing_highs or not swing_lows:
+            return False, False, False, False
+        
+        close = df['close'].iloc[-1]
+        close_prev = df['close'].iloc[-2]
+        last_high = swing_highs[-1]
+        last_low = swing_lows[-1]
+        
+        bullish_bos = market_structure == "BULLISH" and close > last_high and close_prev <= last_high
+        bearish_bos = market_structure == "BEARISH" and close < last_low and close_prev >= last_low
+        bullish_choch = market_structure == "BEARISH" and close > last_high and close_prev <= last_high
+        bearish_choch = market_structure == "BULLISH" and close < last_low and close_prev >= last_low
+        
+        return bullish_bos, bearish_bos, bullish_choch, bearish_choch
+    
+    def detect_fvg(self, df: pd.DataFrame, atr: float) -> List[FVG]:
+        fvgs = []
+        min_size = atr * Config.FVG_MIN_SIZE_ATR
+        n = len(df)
+        
+        for i in range(2, min(n, 50)):
+            idx = n - i  # current bar index
+            if idx - 2 < 0:
+                break
+            
+            # Bullish FVG
+            if df['low'].iloc[idx] > df['high'].iloc[idx - 2]:
+                gap = df['low'].iloc[idx] - df['high'].iloc[idx - 2]
+                if gap >= min_size:
+                    fvg = FVG(
+                        top=df['low'].iloc[idx],
+                        bottom=df['high'].iloc[idx - 2],
+                        bullish=True,
+                        mitigated=df['low'].iloc[-1] <= df['low'].iloc[idx]
+                    )
+                    if not fvg.mitigated:
+                        fvgs.append(fvg)
+            
+            # Bearish FVG
+            if df['high'].iloc[idx] < df['low'].iloc[idx - 2]:
+                gap = df['low'].iloc[idx - 2] - df['high'].iloc[idx]
+                if gap >= min_size:
+                    fvg = FVG(
+                        top=df['low'].iloc[idx - 2],
+                        bottom=df['high'].iloc[idx],
+                        bullish=False,
+                        mitigated=df['high'].iloc[-1] >= df['high'].iloc[idx]
+                    )
+                    if not fvg.mitigated:
+                        fvgs.append(fvg)
+            
+            if len(fvgs) >= Config.MAX_FVG:
+                break
+        
+        return fvgs
+    
+    def detect_order_blocks(self, df: pd.DataFrame, atr: float) -> List[OrderBlock]:
+        obs = []
+        n = len(df)
+        
+        for i in range(3, min(n, 30)):
+            idx = n - i
+            if idx - 1 < 0:
+                break
+            
+            # Bullish OB
+            if (df['close'].iloc[idx - 1] < df['open'].iloc[idx - 1] and
+                df['close'].iloc[idx] > df['open'].iloc[idx] and
+                df['close'].iloc[idx] > df['high'].iloc[idx - 1] and
+                abs(df['close'].iloc[idx] - df['open'].iloc[idx]) > atr * 0.5):
+                
+                ob = OrderBlock(
+                    top=df['high'].iloc[idx - 1],
+                    bottom=df['low'].iloc[idx - 1],
+                    bullish=True,
+                    mitigated=df['low'].iloc[-1] <= df['low'].iloc[idx - 1]
+                )
+                if not ob.mitigated:
+                    obs.append(ob)
+            
+            # Bearish OB
+            if (df['close'].iloc[idx - 1] > df['open'].iloc[idx - 1] and
+                df['close'].iloc[idx] < df['open'].iloc[idx] and
+                df['close'].iloc[idx] < df['low'].iloc[idx - 1] and
+                abs(df['close'].iloc[idx] - df['open'].iloc[idx]) > atr * 0.5):
+                
+                ob = OrderBlock(
+                    top=df['high'].iloc[idx - 1],
+                    bottom=df['low'].iloc[idx - 1],
+                    bullish=False,
+                    mitigated=df['high'].iloc[-1] >= df['high'].iloc[idx - 1]
+                )
+                if not ob.mitigated:
+                    obs.append(ob)
+            
+            if len(obs) >= 10:
+                break
+        
+        return obs
+    
+    def detect_supply_demand_zones(self, swing_highs, swing_lows, atr, current_price):
+        supply_zones, demand_zones = [], []
+        zone_thickness = atr * 1.5
+        
+        for sh in sorted(swing_highs, reverse=True)[:5]:
+            if sh > current_price:
+                supply_zones.append(Zone(
+                    top=sh + zone_thickness * 0.3,
+                    bottom=sh - zone_thickness * 0.7,
+                    zone_type="supply", strength=2 if sh == max(swing_highs) else 1, fresh=True
+                ))
+        
+        for sl in sorted(swing_lows)[:5]:
+            if sl < current_price:
+                demand_zones.append(Zone(
+                    top=sl + zone_thickness * 0.7,
+                    bottom=sl - zone_thickness * 0.3,
+                    zone_type="demand", strength=2 if sl == min(swing_lows) else 1, fresh=True
+                ))
+        
+        return supply_zones, demand_zones
+    
+    def calculate_sr_levels(self, df_daily, df_weekly, df_h4, current_price):
+        levels = []
+        
+        if df_daily is not None and len(df_daily) >= 3:
+            for i in range(1, min(4, len(df_daily))):
+                levels.append(SRLevel(df_daily['high'].iloc[-i], f"D H[{i}]", "daily", 3))
+                levels.append(SRLevel(df_daily['low'].iloc[-i], f"D L[{i}]", "daily", 3))
+        
+        if df_weekly is not None and len(df_weekly) >= 2:
+            for i in range(1, min(3, len(df_weekly))):
+                levels.append(SRLevel(df_weekly['high'].iloc[-i], f"W H[{i}]", "weekly", 4))
+                levels.append(SRLevel(df_weekly['low'].iloc[-i], f"W L[{i}]", "weekly", 4))
+        
+        if df_h4 is not None and len(df_h4) >= 4:
+            for i in range(1, min(5, len(df_h4))):
+                levels.append(SRLevel(df_h4['high'].iloc[-i], f"H4 H[{i}]", "h4", 2))
+                levels.append(SRLevel(df_h4['low'].iloc[-i], f"H4 L[{i}]", "h4", 2))
+        
+        # Pivot Points
+        if df_daily is not None and len(df_daily) >= 2:
+            h = df_daily['high'].iloc[-2]
+            l = df_daily['low'].iloc[-2]
+            c = df_daily['close'].iloc[-2]
+            pivot = (h + l + c) / 3
+            r1, s1 = 2 * pivot - l, 2 * pivot - h
+            r2, s2 = pivot + (h - l), pivot - (h - l)
+            
+            levels.append(SRLevel(pivot, "Pivot", "pivot", 3))
+            levels.append(SRLevel(r1, "R1", "pivot", 2))
+            levels.append(SRLevel(s1, "S1", "pivot", 2))
+            levels.append(SRLevel(r2, "R2", "pivot", 2))
+            levels.append(SRLevel(s2, "S2", "pivot", 2))
+        
+        # Fibonacci
+        if df_daily is not None and len(df_daily) >= 20:
+            fib_high = df_daily['high'].tail(20).max()
+            fib_low = df_daily['low'].tail(20).min()
+            fib_range = fib_high - fib_low
+            
+            if fib_range > 0:
+                if current_price > (fib_high + fib_low) / 2:
+                    for fib, name in [(0.236, "23.6%"), (0.382, "38.2%"), (0.5, "50%"), (0.618, "61.8%")]:
+                        levels.append(SRLevel(fib_high - fib_range * fib, f"Fib {name}", "fib", 2 if fib < 0.5 else 3))
+                else:
+                    for fib, name in [(0.236, "23.6%"), (0.382, "38.2%"), (0.5, "50%"), (0.618, "61.8%")]:
+                        levels.append(SRLevel(fib_low + fib_range * fib, f"Fib {name}", "fib", 2 if fib < 0.5 else 3))
+        
+        return levels
+    
+    def detect_market_maker_candle(self, df, atr):
+        if len(df) < 2:
+            return "NONE", False
+        
+        latest = df.iloc[-1]
+        candle_range = latest['high'] - latest['low']
+        body = abs(latest['close'] - latest['open'])
+        
+        if candle_range <= 0:
+            return "NONE", False
+        
+        body_ratio = body / candle_range
+        upper_wick = latest['high'] - max(latest['open'], latest['close'])
+        lower_wick = min(latest['open'], latest['close']) - latest['low']
+        upper_ratio = upper_wick / candle_range
+        lower_ratio = lower_wick / candle_range
+        is_bullish = latest['close'] > latest['open']
+        
+        if body_ratio >= Config.MM_BODY_RATIO and candle_range >= atr * Config.MM_CANDLE_SIZE_ATR:
+            return ("MM_BULL" if is_bullish else "MM_BEAR"), True
+        
+        if body_ratio <= 0.4:
+            if lower_ratio >= Config.REV_WICK_RATIO:
+                return "REV_BULL", True
+            if upper_ratio >= Config.REV_WICK_RATIO:
+                return "REV_BEAR", True
+        
+        return "NONE", False
+    
+    def detect_candlestick_patterns(self, df):
+        patterns = {
+            'bullish_engulfing': False, 'bearish_engulfing': False,
+            'hammer': False, 'shooting_star': False,
+            'strong_bullish': False, 'strong_bearish': False
+        }
+        
+        if len(df) < 2:
+            return patterns
+        
+        curr, prev = df.iloc[-1], df.iloc[-2]
+        body = abs(curr['close'] - curr['open'])
+        total_range = curr['high'] - curr['low']
+        
+        if total_range <= 0:
+            return patterns
+        
+        body_pct = body / total_range
+        lower_wick = min(curr['close'], curr['open']) - curr['low']
+        upper_wick = curr['high'] - max(curr['close'], curr['open'])
+        
+        if (curr['close'] > curr['open'] and prev['close'] < prev['open'] and
+            curr['open'] <= prev['close'] and curr['close'] >= prev['open']):
+            patterns['bullish_engulfing'] = True
+        
+        if (curr['close'] < curr['open'] and prev['close'] > prev['open'] and
+            curr['open'] >= prev['close'] and curr['close'] <= prev['open']):
+            patterns['bearish_engulfing'] = True
+        
+        if curr['close'] > curr['open'] and body > 0 and lower_wick > body * 1.5:
+            patterns['hammer'] = True
+        
+        if curr['close'] < curr['open'] and body > 0 and upper_wick > body * 1.5:
+            patterns['shooting_star'] = True
+        
+        if body_pct > 0.6:
+            if curr['close'] > curr['open']:
+                patterns['strong_bullish'] = True
+            else:
+                patterns['strong_bearish'] = True
+        
+        return patterns
+    
+    def check_session(self) -> Tuple[str, bool]:
+        """Check trading session (Bangkok time UTC+7)"""
+        hour = get_bangkok_time().hour
+        
+        # London: 14:00-22:00 BKK (07:00-15:00 UTC)
+        # NY: 19:00-04:00 BKK (12:00-21:00 UTC)  
+        # London-NY overlap: 19:00-22:00 BKK
+        # Asia: 07:00-14:00 BKK
+        
+        if 19 <= hour < 22:
+            return "LONDON-NY ⭐⭐", True
+        elif 14 <= hour < 19:
+            return "LONDON ⭐", True
+        elif 22 <= hour or hour < 4:
+            return "NEW YORK", True
+        elif 7 <= hour < 14:
+            return "ASIA", True
+        else:
+            return "OFF-PEAK", False
+    
+    def calculate_confluence(self, df, direction, analysis, patterns, mm_type, bos_choch):
+        score = 0
+        details = {}
+        reasons = []
+        
+        close = df['close'].iloc[-1]
+        bullish_bos, bearish_bos, bullish_choch, bearish_choch = bos_choch
+        
+        if direction == "BUY":
+            if close > analysis.ema50:
+                score += 1; details['ema50'] = True; reasons.append("✅ Above EMA50")
+            if close > analysis.ema200:
+                score += 1; details['ema200'] = True; reasons.append("✅ Above EMA200")
+            if analysis.premium_discount == "DISCOUNT":
+                score += 1; details['discount'] = True; reasons.append("✅ Discount Zone")
+            if analysis.rsi < 50:
+                score += 1; details['rsi'] = True; reasons.append(f"✅ RSI {analysis.rsi:.0f}")
+            if analysis.rsi < Config.RSI_OVERSOLD:
+                score += 1; reasons.append("✅ RSI Oversold")
+            if analysis.adx > Config.ADX_THRESHOLD:
+                score += 1; details['adx'] = True; reasons.append(f"✅ ADX {analysis.adx:.0f}")
+            if analysis.market_structure == "BULLISH":
+                score += 1; details['structure'] = True; reasons.append("✅ Bullish Structure")
+            if analysis.in_kill_zone:
+                score += 1; details['killzone'] = True; reasons.append(f"✅ {analysis.session_name}")
+            for zone in analysis.demand_zones:
+                if zone.bottom <= close <= zone.top:
+                    score += 2; details['demand_zone'] = True; reasons.append("✅ In Demand Zone"); break
+            sr_near = sum(1 for sr in analysis.sr_levels if sr.price < close and close - sr.price < analysis.atr * 0.5)
+            if sr_near > 0:
+                score += min(sr_near, Config.SR_CONFLUENCE_BOOST); details['sr_support'] = True
+                reasons.append(f"✅ Near {sr_near} SR Support")
+            if bullish_bos:
+                score += 1; reasons.append("✅ Bullish BOS")
+            if bullish_choch:
+                score += 1; reasons.append("🔄 Bullish CHOCH")
+            if patterns.get('bullish_engulfing') or patterns.get('hammer'):
+                score += 1; details['pattern'] = True
+                if patterns.get('bullish_engulfing'): reasons.append("✅ Bullish Engulfing")
+                if patterns.get('hammer'): reasons.append("✅ Hammer")
+            if mm_type in ["MM_BULL", "REV_BULL"]:
+                score += 1; details['mm'] = True; reasons.append("✅ MM Bull Signal")
+        
+        else:  # SELL
+            if close < analysis.ema50:
+                score += 1; details['ema50'] = True; reasons.append("✅ Below EMA50")
+            if close < analysis.ema200:
+                score += 1; details['ema200'] = True; reasons.append("✅ Below EMA200")
+            if analysis.premium_discount == "PREMIUM":
+                score += 1; details['premium'] = True; reasons.append("✅ Premium Zone")
+            if analysis.rsi > 50:
+                score += 1; details['rsi'] = True; reasons.append(f"✅ RSI {analysis.rsi:.0f}")
+            if analysis.rsi > Config.RSI_OVERBOUGHT:
+                score += 1; reasons.append("✅ RSI Overbought")
+            if analysis.adx > Config.ADX_THRESHOLD:
+                score += 1; details['adx'] = True; reasons.append(f"✅ ADX {analysis.adx:.0f}")
+            if analysis.market_structure == "BEARISH":
+                score += 1; details['structure'] = True; reasons.append("✅ Bearish Structure")
+            if analysis.in_kill_zone:
+                score += 1; details['killzone'] = True; reasons.append(f"✅ {analysis.session_name}")
+            for zone in analysis.supply_zones:
+                if zone.bottom <= close <= zone.top:
+                    score += 2; details['supply_zone'] = True; reasons.append("✅ In Supply Zone"); break
+            sr_near = sum(1 for sr in analysis.sr_levels if sr.price > close and sr.price - close < analysis.atr * 0.5)
+            if sr_near > 0:
+                score += min(sr_near, Config.SR_CONFLUENCE_BOOST); details['sr_resistance'] = True
+                reasons.append(f"✅ Near {sr_near} SR Resistance")
+            if bearish_bos:
+                score += 1; reasons.append("✅ Bearish BOS")
+            if bearish_choch:
+                score += 1; reasons.append("🔄 Bearish CHOCH")
+            if patterns.get('bearish_engulfing') or patterns.get('shooting_star'):
+                score += 1; details['pattern'] = True
+                if patterns.get('bearish_engulfing'): reasons.append("✅ Bearish Engulfing")
+                if patterns.get('shooting_star'): reasons.append("✅ Shooting Star")
+            if mm_type in ["MM_BEAR", "REV_BEAR"]:
+                score += 1; details['mm'] = True; reasons.append("✅ MM Bear Signal")
+        
+        return score, details, reasons
+    
+    def calculate_entry_levels(self, direction, entry, atr, analysis):
+        if direction == "BUY":
+            zone_sl = analysis.demand_zones[0].bottom if analysis.demand_zones else entry - atr * 2
+            atr_sl = entry - atr * Config.ATR_STOP_MULT
+            sl = max(zone_sl, atr_sl, entry - Config.MAX_RISK_DOLLARS)
+            risk = max(entry - sl, 0.01)
+            tp1 = entry + risk * 1.5
+            tp2 = entry + risk * Config.RR_RATIO
+            tp3 = entry + risk * 3.0
+        else:
+            zone_sl = analysis.supply_zones[0].top if analysis.supply_zones else entry + atr * 2
+            atr_sl = entry + atr * Config.ATR_STOP_MULT
+            sl = min(zone_sl, atr_sl, entry + Config.MAX_RISK_DOLLARS)
+            risk = max(sl - entry, 0.01)
+            tp1 = entry - risk * 1.5
+            tp2 = entry - risk * Config.RR_RATIO
+            tp3 = entry - risk * 3.0
+        
+        dec = Config.SYMBOLS.get('XAUUSD', {}).get('decimals', 2)
+        return round(sl, dec), round(tp1, dec), round(tp2, dec), round(tp3, dec)
+    
+    def analyze(self, symbol: str) -> Optional[Tuple[MarketAnalysis, Optional[Signal]]]:
+        """Complete analysis for a symbol"""
+        try:
+            # Fetch multi-timeframe data
+            df_15m = data_fetcher.fetch(symbol, "15m", "5d")
+            df_daily = data_fetcher.fetch(symbol, "1d", "3mo")
+            df_weekly = data_fetcher.fetch(symbol, "1wk", "6mo")
+            df_h4 = data_fetcher.fetch(symbol, "1h", "1mo")
+            
+            if df_15m is None or len(df_15m) < 20:
+                logger.warning(f"Insufficient data for {symbol}: {len(df_15m) if df_15m is not None else 0} bars")
+                return None
+            
+            dec = Config.SYMBOLS.get(symbol, {}).get('decimals', 2)
+            
+            # Calculate indicators
+            atr_series = self.calculate_atr(df_15m, Config.ATR_PERIOD)
+            atr = atr_series.iloc[-1] if not atr_series.empty else 1.0
+            if pd.isna(atr) or atr <= 0:
+                atr = (df_15m['high'] - df_15m['low']).mean()
+            
+            rsi_series = self.calculate_rsi(df_15m, Config.RSI_PERIOD)
+            rsi = rsi_series.iloc[-1] if not rsi_series.empty else 50.0
+            if pd.isna(rsi):
+                rsi = 50.0
+            
+            adx, plus_di, minus_di = self.calculate_adx(df_15m, Config.ADX_PERIOD)
+            adx_val = adx.iloc[-1] if not adx.empty else 20.0
+            if pd.isna(adx_val):
+                adx_val = 20.0
+            
+            ema50 = self.calculate_ema(df_15m, 50).iloc[-1]
+            ema200 = self.calculate_ema(df_15m, 200).iloc[-1] if len(df_15m) >= 200 else ema50
+            
+            close = df_15m['close'].iloc[-1]
+            prev_close = df_15m['close'].iloc[-2] if len(df_15m) >= 2 else close
+            change = close - prev_close
+            change_pct = (change / prev_close * 100) if prev_close != 0 else 0
+            
+            # Swing points
+            swing_highs, swing_lows = self.find_swing_points(df_15m, Config.SWING_STRENGTH)
+            
+            # Market structure
+            market_structure = self.detect_market_structure(swing_highs, swing_lows)
+            
+            # BOS/CHOCH
+            bos_choch = self.detect_bos_choch(df_15m, swing_highs, swing_lows, market_structure)
+            
+            # Zones
+            supply_zones, demand_zones = self.detect_supply_demand_zones(swing_highs, swing_lows, atr, close)
+            
+            # FVG and Order Blocks
+            fvgs = self.detect_fvg(df_15m, atr)
+            obs = self.detect_order_blocks(df_15m, atr)
+            
+            # SR Levels
+            sr_levels = self.calculate_sr_levels(df_daily, df_weekly, df_h4, close)
+            
+            # Premium/Discount
+            if df_daily is not None and len(df_daily) >= 2:
+                daily_high = df_daily['high'].iloc[-1]
+                daily_low = df_daily['low'].iloc[-1]
+                equilibrium = (daily_high + daily_low) / 2
+                premium_discount = "PREMIUM" if close > equilibrium else "DISCOUNT" if close < equilibrium else "EQUILIBRIUM"
+            else:
+                daily_high = df_15m['high'].max()
+                daily_low = df_15m['low'].min()
+                equilibrium = (daily_high + daily_low) / 2
+                premium_discount = "PREMIUM" if close > equilibrium else "DISCOUNT"
+            
+            # Session
+            session_name, in_kill_zone = self.check_session()
+            
+            # Weekly H/L
+            weekly_high = df_weekly['high'].iloc[-1] if df_weekly is not None and len(df_weekly) >= 1 else daily_high
+            weekly_low = df_weekly['low'].iloc[-1] if df_weekly is not None and len(df_weekly) >= 1 else daily_low
+            
+            # Market Maker & Patterns
+            mm_type, has_mm = self.detect_market_maker_candle(df_15m, atr)
+            patterns = self.detect_candlestick_patterns(df_15m)
+            
+            analysis = MarketAnalysis(
+                symbol=symbol,
+                price=round(close, dec),
+                prev_close=round(prev_close, dec),
+                change=round(change, dec),
+                change_pct=round(change_pct, 2),
+                atr=round(atr, dec + 2),
+                rsi=round(rsi, 1),
+                adx=round(adx_val, 1),
+                ema50=round(ema50, dec),
+                ema200=round(ema200, dec),
+                market_structure=market_structure,
+                trend="UP" if close > ema50 else "DOWN",
+                premium_discount=premium_discount,
+                in_kill_zone=in_kill_zone,
+                session_name=session_name,
+                buy_confluence=0,
+                sell_confluence=0,
+                sr_levels=sr_levels,
+                supply_zones=supply_zones,
+                demand_zones=demand_zones,
+                fvgs=fvgs,
+                order_blocks=obs,
+                swing_high=swing_highs[-1] if swing_highs else close,
+                swing_low=swing_lows[-1] if swing_lows else close,
+                daily_high=round(daily_high, dec),
+                daily_low=round(daily_low, dec),
+                weekly_high=round(weekly_high, dec),
+                weekly_low=round(weekly_low, dec)
+            )
+            
+            # Confluence
+            buy_score, buy_details, buy_reasons = self.calculate_confluence(
+                df_15m, "BUY", analysis, patterns, mm_type, bos_choch)
+            sell_score, sell_details, sell_reasons = self.calculate_confluence(
+                df_15m, "SELL", analysis, patterns, mm_type, bos_choch)
+            
+            analysis.buy_confluence = buy_score
+            analysis.sell_confluence = sell_score
+            
+            # Generate signal
+            signal = None
+            
+            if buy_score >= Config.MIN_CONFLUENCE_SCORE and buy_score > sell_score:
+                has_trigger = (patterns.get('bullish_engulfing') or patterns.get('hammer') or
+                              patterns.get('strong_bullish') or mm_type in ["MM_BULL", "REV_BULL"] or
+                              bos_choch[0] or bos_choch[2])
+                
+                if has_trigger:
+                    sl, tp1, tp2, tp3 = self.calculate_entry_levels("BUY", close, atr, analysis)
+                    risk = max(close - sl, 0.01)
+                    rr = abs(tp2 - close) / risk if risk > 0 else 0
+                    
+                    if rr >= Config.MIN_RR_RATIO:
+                        strength = "🔥 STRONG" if buy_score >= 10 else "⭐ GOOD" if buy_score >= 7 else "📊 MODERATE"
+                        signal = Signal(
+                            signal_id=f"{symbol}_BUY_{get_bangkok_time().strftime('%H%M%S')}",
+                            symbol=symbol, direction="BUY", strength=strength,
+                            entry_price=round(close, dec), stop_loss=sl,
+                            tp1=tp1, tp2=tp2, tp3=tp3,
+                            risk_dollars=round(risk, dec), risk_reward=round(rr, 2),
+                            confluence_score=buy_score, confluence_details=buy_details,
+                            reasons=buy_reasons, session_name=session_name,
+                            market_structure=market_structure, premium_discount=premium_discount,
+                            sr_levels_near=len([sr for sr in sr_levels if abs(sr.price - close) < atr]),
+                            timestamp=format_datetime(), timestamp_unix=time.time()
+                        )
+            
+            elif sell_score >= Config.MIN_CONFLUENCE_SCORE and sell_score > buy_score:
+                has_trigger = (patterns.get('bearish_engulfing') or patterns.get('shooting_star') or
+                              patterns.get('strong_bearish') or mm_type in ["MM_BEAR", "REV_BEAR"] or
+                              bos_choch[1] or bos_choch[3])
+                
+                if has_trigger:
+                    sl, tp1, tp2, tp3 = self.calculate_entry_levels("SELL", close, atr, analysis)
+                    risk = max(sl - close, 0.01)
+                    rr = abs(close - tp2) / risk if risk > 0 else 0
+                    
+                    if rr >= Config.MIN_RR_RATIO:
+                        strength = "🔥 STRONG" if sell_score >= 10 else "⭐ GOOD" if sell_score >= 7 else "📊 MODERATE"
+                        signal = Signal(
+                            signal_id=f"{symbol}_SELL_{get_bangkok_time().strftime('%H%M%S')}",
+                            symbol=symbol, direction="SELL", strength=strength,
+                            entry_price=round(close, dec), stop_loss=sl,
+                            tp1=tp1, tp2=tp2, tp3=tp3,
+                            risk_dollars=round(risk, dec), risk_reward=round(rr, 2),
+                            confluence_score=sell_score, confluence_details=sell_details,
+                            reasons=sell_reasons, session_name=session_name,
+                            market_structure=market_structure, premium_discount=premium_discount,
+                            sr_levels_near=len([sr for sr in sr_levels if abs(sr.price - close) < atr]),
+                            timestamp=format_datetime(), timestamp_unix=time.time()
+                        )
+            
+            return analysis, signal
+            
+        except Exception as e:
+            logger.error(f"Analysis error {symbol}: {e}\n{traceback.format_exc()}")
+            store.add_error(f"{symbol}: {str(e)}")
+            return None
+
+analyzer = UTSProAnalyzer()
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# BACKGROUND SCANNER
+# ═══════════════════════════════════════════════════════════════════════════════
 def background_scanner():
-    global scanner_running
-    scanner_running = True
+    """Background scanner with proper error handling and socketio context"""
+    eventlet.sleep(3)
+    logger.info(f"🚀 UTS Pro Scanner started at {format_time()}")
+    store.scanner_status = "RUNNING"
     
-    print(f"[{format_bangkok_time()}] 🚀 Scanner thread started!")
-    
-    # Initial delay to let server start
-    time.sleep(3)
+    consecutive_failures = 0
     
     while True:
         try:
             store.scan_count += 1
-            store.last_scan = format_bangkok_time()
+            store.last_scan = format_time()
+            scan_start = time.time()
             
-            print(f"\n[{format_bangkok_time()}] ═══════════════════════════════════")
-            print(f"[{format_bangkok_time()}] 📡 Scan #{store.scan_count} starting...")
+            logger.info(f"\n{'='*50}")
+            logger.info(f"📡 Scan #{store.scan_count} at {store.last_scan}")
             
-            for symbol in Config.SYMBOLS.keys():
-                print(f"[{format_bangkok_time()}] Processing {symbol}...")
-                
-                # Fetch price
-                price = fetcher.get_current_price(symbol)
-                if price:
-                    store.prices[symbol] = price
-                    socketio.emit('price_update', {'symbol': symbol, 'data': price})
-                    print(f"[{format_bangkok_time()}] ✅ {symbol} price: ${price['price']}")
-                else:
-                    print(f"[{format_bangkok_time()}] ⚠️ No price for {symbol}")
-                
-                # Generate signal
-                sig = generator.generate_signal(symbol)
-                if sig:
-                    old = store.signals.get(symbol)
-                    if not old or old.direction != sig.direction or time.time() - old.timestamp_unix > 1800:
-                        store.signals[symbol] = sig
-                        store.history.insert(0, sig)
-                        store.history = store.history[:100]
+            symbols_ok = 0
+            symbols_fail = 0
+            
+            for symbol, sym_config in Config.SYMBOLS.items():
+                try:
+                    result = analyzer.analyze(symbol)
+                    
+                    if result:
+                        analysis, signal = result
+                        symbols_ok += 1
                         
-                        if sig.direction == "BUY":
-                            store.total_buy_signals += 1
-                        else:
-                            store.total_sell_signals += 1
+                        # Update price data
+                        store.prices[symbol] = {
+                            'symbol': symbol,
+                            'name': sym_config['name'],
+                            'emoji': sym_config['emoji'],
+                            'price': analysis.price,
+                            'prev_close': analysis.prev_close,
+                            'change': analysis.change,
+                            'change_pct': analysis.change_pct,
+                            'high': analysis.daily_high,
+                            'low': analysis.daily_low,
+                            'time': format_time()
+                        }
                         
-                        socketio.emit('new_signal', {'symbol': symbol, 'signal': asdict(sig)})
-                        print(f"[{format_bangkok_time()}] 🎯 NEW SIGNAL: {symbol} {sig.direction} @ ${sig.entry_price}")
+                        # Update analysis
+                        store.analysis[symbol] = analysis
+                        
+                        # Build analysis summary for frontend
+                        analysis_summary = {
+                            'rsi': analysis.rsi,
+                            'adx': analysis.adx,
+                            'atr': analysis.atr,
+                            'ema50': analysis.ema50,
+                            'ema200': analysis.ema200,
+                            'structure': analysis.market_structure,
+                            'trend': analysis.trend,
+                            'zone': analysis.premium_discount,
+                            'buy_score': analysis.buy_confluence,
+                            'sell_score': analysis.sell_confluence,
+                            'session': analysis.session_name,
+                            'in_kill_zone': analysis.in_kill_zone,
+                            'sr_count': len(analysis.sr_levels),
+                            'supply_zones': len(analysis.supply_zones),
+                            'demand_zones': len(analysis.demand_zones),
+                            'fvg_count': len(analysis.fvgs),
+                            'ob_count': len(analysis.order_blocks),
+                            'swing_high': analysis.swing_high,
+                            'swing_low': analysis.swing_low
+                        }
+                        
+                        # Emit price update via socketio
+                        socketio.emit('price_update', {
+                            'symbol': symbol,
+                            'data': store.prices[symbol],
+                            'analysis': analysis_summary
+                        })
+                        
+                        logger.info(f"  💰 {symbol}: ${analysis.price} | Chg: {analysis.change_pct:+.2f}%")
+                        logger.info(f"     RSI:{analysis.rsi:.0f} ADX:{analysis.adx:.0f} | {analysis.market_structure} | {analysis.premium_discount}")
+                        logger.info(f"     Buy:{analysis.buy_confluence}/15 Sell:{analysis.sell_confluence}/15 | SR:{len(analysis.sr_levels)} FVG:{len(analysis.fvgs)} OB:{len(analysis.order_blocks)}")
+                        
+                        # Handle signal
+                        if signal:
+                            old_signal = store.signals.get(symbol)
+                            is_new = (not old_signal or
+                                     old_signal.direction != signal.direction or
+                                     time.time() - old_signal.timestamp_unix > 1800)
+                            
+                            if is_new:
+                                store.signals[symbol] = signal
+                                store.history.insert(0, signal)
+                                store.history = store.history[:100]
+                                
+                                if signal.direction == "BUY":
+                                    store.stats['total_buy'] += 1
+                                else:
+                                    store.stats['total_sell'] += 1
+                                
+                                socketio.emit('new_signal', {
+                                    'symbol': symbol,
+                                    'signal': asdict(signal)
+                                })
+                                
+                                logger.info(f"  🎯 NEW SIGNAL: {symbol} {signal.direction} @ ${signal.entry_price}")
+                                logger.info(f"     SL: ${signal.stop_loss} | TP1: ${signal.tp1} | TP2: ${signal.tp2} | TP3: ${signal.tp3}")
+                                logger.info(f"     Score: {signal.confluence_score}/15 | R:R: {signal.risk_reward}:1")
+                    else:
+                        symbols_fail += 1
+                        logger.warning(f"  ⚠️ {symbol}: No data returned")
+                
+                except Exception as e:
+                    symbols_fail += 1
+                    logger.error(f"  ❌ {symbol} error: {e}")
+                    store.add_error(f"{symbol}: {str(e)}")
                 
                 # Small delay between symbols to avoid rate limiting
-                time.sleep(5)
+                eventlet.sleep(2)
+            
+            scan_duration = time.time() - scan_start
             
             # Emit scan update
             socketio.emit('scan_update', {
                 'scan_count': store.scan_count,
                 'last_scan': store.last_scan,
                 'connected': store.connected_clients,
-                'stats': {
-                    'total_buy': store.total_buy_signals,
-                    'total_sell': store.total_sell_signals
-                }
+                'stats': store.stats,
+                'scanner_status': store.scanner_status,
+                'symbols_ok': symbols_ok,
+                'symbols_fail': symbols_fail,
+                'scan_duration': round(scan_duration, 1)
             })
             
-            print(f"[{format_bangkok_time()}] ✅ Scan #{store.scan_count} complete")
-            print(f"[{format_bangkok_time()}] ═══════════════════════════════════\n")
+            logger.info(f"  ✅ Scan complete: {symbols_ok} OK, {symbols_fail} failed ({scan_duration:.1f}s)")
+            
+            if symbols_ok > 0:
+                consecutive_failures = 0
+            else:
+                consecutive_failures += 1
+                if consecutive_failures > 5:
+                    logger.warning("⚠️ Multiple consecutive scan failures - market may be closed")
+                    store.scanner_status = "MARKET_CLOSED"
+                    socketio.emit('scanner_status', {'status': 'MARKET_CLOSED', 'message': 'Market may be closed or data unavailable'})
             
         except Exception as e:
-            error_msg = f"Scanner error: {e}"
-            print(f"[{format_bangkok_time()}] ❌ {error_msg}")
-            traceback.print_exc()
-            store.errors.append({'time': format_bangkok_datetime(), 'error': str(e)})
-            store.errors = store.errors[-10:]  # Keep last 10 errors
+            logger.error(f"Scanner loop error: {e}\n{traceback.format_exc()}")
+            store.add_error(f"Scanner: {str(e)}")
         
-        # Wait before next scan
-        time.sleep(Config.SCAN_INTERVAL)
+        eventlet.sleep(Config.SCAN_INTERVAL)
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# HTML TEMPLATES
+# ═══════════════════════════════════════════════════════════════════════════════
+
+LOGIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>🎯 UTS Pro v4 - Login</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 min-h-screen flex items-center justify-center">
+    <div class="bg-gray-800 p-8 rounded-2xl shadow-2xl w-full max-w-md">
+        <div class="text-center mb-8">
+            <div class="text-5xl mb-4">⚡</div>
+            <h1 class="text-2xl font-bold text-white">UTS Pro v4</h1>
+            <p class="text-gray-400">Ultimate Trading System</p>
+        </div>
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}{% for cat, msg in messages %}
+        <div class="mb-4 p-3 rounded-lg {% if cat == 'error' %}bg-red-900 text-red-200{% else %}bg-green-900 text-green-200{% endif %}">{{ msg }}</div>
+        {% endfor %}{% endif %}{% endwith %}
+        <form method="POST" class="space-y-6">
+            <div><label class="block text-gray-300 text-sm mb-2">Username</label>
+            <input type="text" name="username" required class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:border-yellow-500 focus:outline-none"></div>
+            <div><label class="block text-gray-300 text-sm mb-2">Password</label>
+            <input type="password" name="password" required class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:border-yellow-500 focus:outline-none"></div>
+            <button type="submit" class="w-full py-3 bg-yellow-600 hover:bg-yellow-700 text-white font-bold rounded-lg transition">🔓 Login</button>
+        </form>
+        <p class="mt-4 text-center text-gray-500 text-sm">Default: admin / admin123</p>
+    </div>
+</body></html>
+'''
+
+DASHBOARD_TEMPLATE = '''
+<!DOCTYPE html>
+<html><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>⚡ UTS Pro v4 Dashboard</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+    <style>
+        @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}.pulse{animation:pulse 1.5s infinite}
+        @keyframes glow{0%,100%{box-shadow:0 0 5px #ffd700}50%{box-shadow:0 0 25px #ffd700}}.glow{animation:glow 1.5s infinite}
+        @keyframes slideIn{from{transform:translateY(-20px);opacity:0}to{transform:translateY(0);opacity:1}}.slide-in{animation:slideIn .3s}
+        @keyframes fadeIn{from{opacity:0}to{opacity:1}}.fade-in{animation:fadeIn .5s}
+        .scrollbar::-webkit-scrollbar{width:6px}.scrollbar::-webkit-scrollbar-track{background:#1f2937}.scrollbar::-webkit-scrollbar-thumb{background:#4b5563;border-radius:3px}
+        .price-up{color:#4ade80;transition:color .3s}.price-down{color:#f87171;transition:color .3s}
+    </style>
+</head>
+<body class="bg-gray-900 text-white min-h-screen">
+    <div class="container mx-auto px-4 py-4 max-w-7xl">
+        <!-- Header -->
+        <div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-4 gap-3">
+            <div>
+                <h1 class="text-xl md:text-2xl font-bold flex items-center gap-2">
+                    ⚡ UTS Pro v4 
+                    <span class="text-sm text-yellow-400">Ultimate Trading System</span>
+                </h1>
+                <p class="text-gray-400 text-sm">Welcome, <span class="text-yellow-400">{{ username }}</span> • SMC • Multi-TF S/R • Supply/Demand • FVG</p>
+            </div>
+            <div class="flex items-center gap-3">
+                <div id="clock" class="bg-gray-800 px-3 py-2 rounded-lg font-mono text-sm">TH --:--:--</div>
+                <span id="status" class="text-red-400 text-sm">● Connecting...</span>
+                <span id="scannerBadge" class="hidden bg-blue-600 px-2 py-1 rounded text-xs">SCANNING</span>
+                {% if is_admin %}<a href="/admin" class="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 rounded-lg text-sm">👑 Admin</a>{% endif %}
+                <a href="/logout" class="px-3 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-sm">🚪</a>
+            </div>
+        </div>
+
+        <!-- Stats Row -->
+        <div class="grid grid-cols-3 md:grid-cols-7 gap-2 mb-4">
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-gray-400 text-xs">Scans</div>
+                <div id="scanCount" class="font-bold text-lg">0</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-gray-400 text-xs">Active Signals</div>
+                <div id="signalCount" class="font-bold text-lg text-green-400">0</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-gray-400 text-xs">Last Scan</div>
+                <div id="lastScan" class="font-mono text-sm mt-1">--:--</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-gray-400 text-xs">Session</div>
+                <div id="session" class="text-yellow-400 text-sm mt-1">-</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-gray-400 text-xs">Buy Signals</div>
+                <div id="buyCount" class="text-green-400 font-bold text-lg">0</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-gray-400 text-xs">Sell Signals</div>
+                <div id="sellCount" class="text-red-400 font-bold text-lg">0</div>
+            </div>
+            <div class="bg-gray-800 rounded-lg p-2 text-center">
+                <div class="text-gray-400 text-xs">Scanner</div>
+                <div id="scannerStatus" class="text-blue-400 text-sm mt-1">STARTING</div>
+            </div>
+        </div>
+
+        <!-- Alert Area -->
+        <div id="alertArea" class="hidden mb-4">
+            <div class="bg-gradient-to-r from-yellow-900 to-yellow-800 border-2 border-yellow-500 rounded-xl p-4 glow">
+                <div class="flex items-center gap-3">
+                    <span class="text-3xl">🎯</span>
+                    <div>
+                        <div id="alertTitle" class="text-xl font-bold">NEW SIGNAL!</div>
+                        <div id="alertText" class="text-yellow-200"></div>
+                    </div>
+                    <button onclick="document.getElementById('alertArea').classList.add('hidden')" class="ml-auto text-yellow-400 hover:text-white text-xl">✕</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Main Grid -->
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-4 mb-4">
+            <!-- Left Column: Prices + Confluence -->
+            <div class="lg:col-span-1 space-y-4">
+                <h2 class="font-bold flex items-center gap-2">💰 Live Prices <span id="priceStatus" class="text-xs text-gray-500">waiting...</span></h2>
+                <div id="prices" class="space-y-3">
+                    <div class="bg-gray-800 rounded-lg p-4 text-center text-gray-500">
+                        <div class="text-2xl mb-2">📡</div>
+                        <div>Connecting to market data...</div>
+                        <div class="text-xs mt-1">First scan may take 15-30 seconds</div>
+                    </div>
+                </div>
+
+                <!-- Confluence Panel -->
+                <div class="bg-gray-800 rounded-xl p-4">
+                    <h3 class="font-bold mb-3 text-yellow-400">🎯 Confluence Scores</h3>
+                    <div id="confluence" class="space-y-2 text-sm">
+                        <div class="text-gray-500">Waiting for analysis...</div>
+                    </div>
+                </div>
+
+                <!-- Technical Summary -->
+                <div class="bg-gray-800 rounded-xl p-4">
+                    <h3 class="font-bold mb-3 text-blue-400">📊 Technical Summary</h3>
+                    <div id="techSummary" class="space-y-2 text-sm">
+                        <div class="text-gray-500">Waiting for data...</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Right Column: Signals -->
+            <div class="lg:col-span-2">
+                <h2 class="font-bold mb-3">🎯 Active Trading Signals</h2>
+                <div id="signals" class="grid grid-cols-1 xl:grid-cols-2 gap-4">
+                    <div class="bg-gray-800 rounded-xl p-6 text-center text-gray-400 col-span-full">
+                        <div class="text-4xl mb-2">📡</div>
+                        <div>Scanning for high-probability setups...</div>
+                        <div class="text-sm mt-2">Min Confluence: 5/15 | Min R:R: 1.5:1</div>
+                        <div class="text-xs mt-2 text-gray-600">Signals require pattern confirmation + confluence score</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- History Table -->
+        <div class="bg-gray-800 rounded-xl overflow-hidden mb-4">
+            <h2 class="font-bold p-4 border-b border-gray-700">📜 Signal History</h2>
+            <div class="overflow-x-auto">
+                <table class="w-full text-sm">
+                    <thead class="bg-gray-700">
+                        <tr>
+                            <th class="px-3 py-2 text-left">Time</th>
+                            <th class="px-3 py-2 text-left">Symbol</th>
+                            <th class="px-3 py-2 text-left">Dir</th>
+                            <th class="px-3 py-2 text-left">Entry</th>
+                            <th class="px-3 py-2 text-left">SL</th>
+                            <th class="px-3 py-2 text-left">TP1</th>
+                            <th class="px-3 py-2 text-left">TP2</th>
+                            <th class="px-3 py-2 text-left">TP3</th>
+                            <th class="px-3 py-2 text-left">R:R</th>
+                            <th class="px-3 py-2 text-left">Score</th>
+                            <th class="px-3 py-2 text-left">Structure</th>
+                        </tr>
+                    </thead>
+                    <tbody id="history">
+                        <tr><td colspan="11" class="px-3 py-4 text-center text-gray-500">No signals yet...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+        </div>
+
+        <!-- Event Log -->
+        <div class="bg-gray-800 rounded-xl p-4">
+            <div class="flex justify-between items-center mb-2">
+                <h2 class="font-bold">📡 Event Log</h2>
+                <button onclick="document.getElementById('log').innerHTML=''" class="text-xs text-gray-500 hover:text-white">Clear</button>
+            </div>
+            <div id="log" class="h-40 overflow-y-auto font-mono text-xs scrollbar space-y-1"></div>
+        </div>
+
+        <div class="mt-4 text-center text-gray-600 text-xs">
+            ⚠️ Educational purposes only. Not financial advice. Based on UTS Pro v4 Pine Script Strategy.
+        </div>
+    </div>
+
+    <script>
+        // ─── State ───
+        let prices = {};
+        let signals = {};
+        let history = [];
+        let analysisData = {};
+        let connected = false;
+        let lastPriceUpdate = {};
+
+        // ─── Socket Connection ───
+        const socket = io({
+            transports: ['websocket', 'polling'],
+            reconnection: true,
+            reconnectionDelay: 1000,
+            reconnectionAttempts: Infinity,
+            timeout: 20000
+        });
+
+        // ─── Clock ───
+        function updateClock() {
+            const now = new Date();
+            const bkk = new Date(now.toLocaleString("en-US", {timeZone: "Asia/Bangkok"}));
+            const timeStr = bkk.toLocaleTimeString('en-GB', {hour12: false});
+            document.getElementById('clock').textContent = 'TH ' + timeStr;
+            
+            const h = bkk.getHours();
+            let sessionText = 'OFF-PEAK';
+            if (h >= 19 && h < 22) sessionText = 'LONDON-NY ⭐⭐';
+            else if (h >= 14 && h < 19) sessionText = 'LONDON ⭐';
+            else if (h >= 22 || h < 4) sessionText = 'NEW YORK';
+            else if (h >= 7 && h < 14) sessionText = 'ASIA';
+            document.getElementById('session').textContent = sessionText;
+        }
+        setInterval(updateClock, 1000);
+        updateClock();
+
+        // ─── Logging ───
+        function log(msg, type = 'info') {
+            const el = document.getElementById('log');
+            const t = new Date().toLocaleTimeString('en-GB', {timeZone: 'Asia/Bangkok', hour12: false});
+            const colors = {
+                signal: 'text-green-400', price: 'text-blue-300',
+                error: 'text-red-400', info: 'text-gray-400',
+                warn: 'text-yellow-400', system: 'text-purple-400'
+            };
+            const color = colors[type] || 'text-gray-400';
+            const div = document.createElement('div');
+            div.className = color;
+            div.textContent = `[${t}] ${msg}`;
+            el.insertBefore(div, el.firstChild);
+            // Keep max 200 entries
+            while (el.children.length > 200) el.removeChild(el.lastChild);
+        }
+
+        // ─── Render Functions ───
+        function renderPrices() {
+            const syms = {
+                XAUUSD: ['🥇', 'GOLD'], 
+                XAGUSD: ['🥈', 'SILVER'], 
+                USOUSD: ['🛢️', 'OIL']
+            };
+            
+            let html = '';
+            let hasData = false;
+            
+            for (const [sym, [emoji, name]] of Object.entries(syms)) {
+                const p = prices[sym];
+                const a = analysisData[sym] || {};
+                
+                if (!p || !p.price) {
+                    html += `
+                    <div class="bg-gray-700/50 rounded-lg p-3 border border-gray-700">
+                        <div class="flex justify-between items-center">
+                            <span class="font-bold text-gray-400">${emoji} ${name}</span>
+                            <span class="text-gray-500 pulse">Loading...</span>
+                        </div>
+                    </div>`;
+                    continue;
+                }
+                
+                hasData = true;
+                const chgColor = p.change >= 0 ? 'text-green-400' : 'text-red-400';
+                const chgIcon = p.change >= 0 ? '▲' : '▼';
+                const structColor = a.structure === 'BULLISH' ? 'text-green-400' : a.structure === 'BEARISH' ? 'text-red-400' : 'text-yellow-400';
+                const zoneColor = a.zone === 'PREMIUM' ? 'text-red-400' : a.zone === 'DISCOUNT' ? 'text-green-400' : 'text-gray-400';
+                const rsiColor = (a.rsi || 50) < 30 ? 'text-green-400' : (a.rsi || 50) > 70 ? 'text-red-400' : 'text-white';
+                const adxColor = (a.adx || 0) > 25 ? 'text-green-400' : 'text-gray-400';
+                
+                // Confluence bar colors
+                const buyBarW = ((a.buy_score || 0) / 15 * 100);
+                const sellBarW = ((a.sell_score || 0) / 15 * 100);
+                
+                html += `
+                <div class="bg-gray-700 rounded-lg p-3 border border-gray-600 hover:border-gray-500 transition">
+                    <div class="flex justify-between items-center mb-2">
+                        <div>
+                            <span class="font-bold text-lg">${emoji} ${name}</span>
+                            <span class="text-xs text-gray-400 ml-1">${sym}</span>
+                        </div>
+                        <div class="text-right">
+                            <div class="text-2xl font-bold">$${Number(p.price).toLocaleString(undefined, {minimumFractionDigits: 2})}</div>
+                            <div class="${chgColor} text-xs">${chgIcon} ${p.change >= 0 ? '+' : ''}${p.change} (${p.change_pct >= 0 ? '+' : ''}${p.change_pct}%)</div>
+                        </div>
+                    </div>
+                    <div class="grid grid-cols-2 gap-x-4 gap-y-1 text-xs border-t border-gray-600 pt-2">
+                        <div>RSI: <span class="${rsiColor} font-bold">${a.rsi || '-'}</span></div>
+                        <div>ADX: <span class="${adxColor} font-bold">${a.adx || '-'}</span></div>
+                        <div>Structure: <span class="${structColor} font-bold">${a.structure || '-'}</span></div>
+                        <div>Zone: <span class="${zoneColor} font-bold">${a.zone || '-'}</span></div>
+                        <div>H: <span class="text-green-400">$${p.high || '-'}</span></div>
+                        <div>L: <span class="text-red-400">$${p.low || '-'}</span></div>
+                    </div>
+                    <div class="mt-2 grid grid-cols-2 gap-2">
+                        <div>
+                            <div class="flex justify-between text-xs mb-1">
+                                <span class="text-green-400">BUY</span>
+                                <span class="text-green-400 font-bold">${a.buy_score || 0}/15</span>
+                            </div>
+                            <div class="bg-gray-600 rounded-full h-1.5">
+                                <div class="bg-green-500 h-1.5 rounded-full transition-all" style="width:${buyBarW}%"></div>
+                            </div>
+                        </div>
+                        <div>
+                            <div class="flex justify-between text-xs mb-1">
+                                <span class="text-red-400">SELL</span>
+                                <span class="text-red-400 font-bold">${a.sell_score || 0}/15</span>
+                            </div>
+                            <div class="bg-gray-600 rounded-full h-1.5">
+                                <div class="bg-red-500 h-1.5 rounded-full transition-all" style="width:${sellBarW}%"></div>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="mt-1 text-xs text-gray-500 flex justify-between">
+                        <span>SR: ${a.sr_count || 0} | FVG: ${a.fvg_count || 0} | OB: ${a.ob_count || 0}</span>
+                        <span>${p.time || ''}</span>
+                    </div>
+                </div>`;
+            }
+            
+            document.getElementById('prices').innerHTML = html;
+            document.getElementById('priceStatus').innerHTML = hasData ? 
+                '<span class="text-green-400 pulse">● LIVE</span>' : 
+                '<span class="text-gray-500 pulse">● waiting...</span>';
+        }
+
+        function renderConfluence() {
+            let html = '';
+            for (const [sym, a] of Object.entries(analysisData)) {
+                const buyOk = (a.buy_score || 0) >= 5;
+                const sellOk = (a.sell_score || 0) >= 5;
+                
+                html += `
+                <div class="flex justify-between items-center py-2 border-b border-gray-700 last:border-0">
+                    <span class="font-bold">${sym}</span>
+                    <div class="flex gap-2">
+                        <span class="px-2 py-1 rounded text-xs font-bold ${buyOk ? 'bg-green-900 text-green-400 border border-green-700' : 'bg-gray-700 text-gray-500'}">
+                            BUY ${a.buy_score || 0}/15 ${buyOk ? '✓' : ''}
+                        </span>
+                        <span class="px-2 py-1 rounded text-xs font-bold ${sellOk ? 'bg-red-900 text-red-400 border border-red-700' : 'bg-gray-700 text-gray-500'}">
+                            SELL ${a.sell_score || 0}/15 ${sellOk ? '✓' : ''}
+                        </span>
+                    </div>
+                </div>`;
+            }
+            document.getElementById('confluence').innerHTML = html || '<div class="text-gray-500">Waiting for analysis...</div>';
+        }
+
+        function renderTechSummary() {
+            let html = '';
+            for (const [sym, a] of Object.entries(analysisData)) {
+                const trendIcon = a.trend === 'UP' ? '📈' : '📉';
+                html += `
+                <div class="py-2 border-b border-gray-700 last:border-0">
+                    <div class="font-bold text-sm mb-1">${sym} ${trendIcon}</div>
+                    <div class="grid grid-cols-2 gap-1 text-xs text-gray-400">
+                        <div>EMA50: $${a.ema50 || '-'}</div>
+                        <div>EMA200: $${a.ema200 || '-'}</div>
+                        <div>ATR: ${a.atr || '-'}</div>
+                        <div>Session: ${a.session || '-'}</div>
+                        <div>Supply Zones: ${a.supply_zones || 0}</div>
+                        <div>Demand Zones: ${a.demand_zones || 0}</div>
+                    </div>
+                </div>`;
+            }
+            document.getElementById('techSummary').innerHTML = html || '<div class="text-gray-500">Waiting for data...</div>';
+        }
+
+        function renderSignals() {
+            const list = Object.values(signals);
+            if (!list.length) {
+                document.getElementById('signals').innerHTML = `
+                    <div class="bg-gray-800 rounded-xl p-6 text-center text-gray-400 col-span-full">
+                        <div class="text-4xl mb-2">📡</div>
+                        <div>Scanning for high-probability setups...</div>
+                        <div class="text-sm mt-2">Min Confluence: 5/15 | Min R:R: 1.5:1</div>
+                    </div>`;
+                document.getElementById('signalCount').textContent = '0';
+                return;
+            }
+
+            let html = '';
+            for (const s of list) {
+                const isBuy = s.direction === 'BUY';
+                const border = isBuy ? 'border-green-500' : 'border-red-500';
+                const bg = isBuy ? 'from-green-900/30' : 'from-red-900/30';
+                const dir = isBuy ? 'text-green-400' : 'text-red-400';
+                const scoreWidth = ((s.confluence_score || 0) / 15 * 100);
+
+                html += `
+                <div class="bg-gradient-to-br ${bg} to-gray-800 rounded-xl p-4 border-l-4 ${border} slide-in">
+                    <div class="flex justify-between items-start mb-3">
+                        <div>
+                            <div class="text-xl font-bold ${dir}">${isBuy ? '🟢' : '🔴'} ${s.symbol} ${s.direction}</div>
+                            <div class="text-xs text-gray-400">${s.session_name || s.session || ''} | ${s.market_structure} | ${s.premium_discount}</div>
+                        </div>
+                        <div class="text-right">
+                            <span class="bg-yellow-600/80 px-2 py-1 rounded text-xs font-bold">${s.strength}</span>
+                            <div class="text-xs text-gray-400 mt-1">${s.timestamp}</div>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-2 gap-2 mb-3 text-sm">
+                        <div class="bg-gray-900/50 rounded p-2">
+                            <div class="text-xs text-gray-400">Entry</div>
+                            <div class="font-bold text-lg">$${s.entry_price}</div>
+                        </div>
+                        <div class="bg-red-900/30 rounded p-2 border border-red-900">
+                            <div class="text-xs text-red-400">Stop Loss</div>
+                            <div class="font-bold text-red-400">$${s.stop_loss}</div>
+                            <div class="text-xs text-gray-500">Risk: $${s.risk_dollars}</div>
+                        </div>
+                    </div>
+
+                    <div class="grid grid-cols-3 gap-1 mb-3 text-xs">
+                        <div class="bg-green-900/30 rounded p-2 text-center border border-green-900">
+                            <div class="text-green-400">TP1</div>
+                            <div class="font-bold text-green-400">$${s.tp1}</div>
+                        </div>
+                        <div class="bg-green-900/40 rounded p-2 text-center border border-green-700">
+                            <div class="text-green-300">TP2</div>
+                            <div class="font-bold text-green-300">$${s.tp2}</div>
+                        </div>
+                        <div class="bg-green-900/50 rounded p-2 text-center border border-green-500">
+                            <div class="text-green-200">TP3</div>
+                            <div class="font-bold text-green-200">$${s.tp3}</div>
+                        </div>
+                    </div>
+
+                    <div class="mb-2">
+                        <div class="flex justify-between text-xs mb-1">
+                            <span>Confluence</span>
+                            <span class="font-bold">${s.confluence_score}/15 | R:R ${s.risk_reward}:1</span>
+                        </div>
+                        <div class="bg-gray-700 rounded-full h-2">
+                            <div class="h-2 rounded-full transition-all ${s.confluence_score >= 10 ? 'bg-green-500' : s.confluence_score >= 7 ? 'bg-yellow-500' : 'bg-orange-500'}" style="width:${scoreWidth}%"></div>
+                        </div>
+                    </div>
+
+                    <div class="flex flex-wrap gap-1">
+                        ${(s.reasons || []).slice(0, 8).map(r => `<span class="bg-gray-700/80 px-2 py-0.5 rounded text-xs">${r}</span>`).join('')}
+                    </div>
+                </div>`;
+            }
+            document.getElementById('signals').innerHTML = html;
+            document.getElementById('signalCount').textContent = list.length;
+        }
+
+        function renderHistory() {
+            if (!history.length) {
+                document.getElementById('history').innerHTML = '<tr><td colspan="11" class="px-3 py-4 text-center text-gray-500">No signals yet...</td></tr>';
+                return;
+            }
+            document.getElementById('history').innerHTML = history.slice(0, 30).map(s => `
+                <tr class="border-t border-gray-700 hover:bg-gray-700/30 transition">
+                    <td class="px-3 py-2 text-xs text-gray-400">${s.timestamp}</td>
+                    <td class="px-3 py-2 font-bold">${s.symbol}</td>
+                    <td class="px-3 py-2">
+                        <span class="${s.direction === 'BUY' ? 'text-green-400 bg-green-900/30' : 'text-red-400 bg-red-900/30'} px-2 py-1 rounded text-xs font-bold">${s.direction}</span>
+                    </td>
+                    <td class="px-3 py-2 font-mono">$${s.entry_price}</td>
+                    <td class="px-3 py-2 text-red-400 font-mono">$${s.stop_loss}</td>
+                    <td class="px-3 py-2 text-green-400 font-mono">$${s.tp1}</td>
+                    <td class="px-3 py-2 text-green-300 font-mono">$${s.tp2}</td>
+                    <td class="px-3 py-2 text-green-200 font-mono">$${s.tp3}</td>
+                    <td class="px-3 py-2 font-bold">${s.risk_reward}:1</td>
+                    <td class="px-3 py-2">
+                        <span class="px-2 py-0.5 rounded text-xs ${s.confluence_score >= 10 ? 'bg-green-900 text-green-400' : s.confluence_score >= 7 ? 'bg-yellow-900 text-yellow-400' : 'bg-gray-700 text-gray-300'}">${s.confluence_score}/15</span>
+                    </td>
+                    <td class="px-3 py-2 text-xs">${s.market_structure}</td>
+                </tr>`).join('');
+        }
+
+        function showAlert(signal) {
+            const el = document.getElementById('alertArea');
+            document.getElementById('alertTitle').textContent = `🎯 NEW ${signal.direction} SIGNAL!`;
+            document.getElementById('alertText').textContent = 
+                `${signal.symbol} @ $${signal.entry_price} | SL: $${signal.stop_loss} | TP2: $${signal.tp2} | Score: ${signal.confluence_score}/15 | R:R: ${signal.risk_reward}:1`;
+            el.classList.remove('hidden');
+            
+            // Sound
+            try {
+                const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                osc.connect(gain); gain.connect(ctx.destination);
+                osc.frequency.value = signal.direction === 'BUY' ? 880 : 660;
+                gain.gain.value = 0.15;
+                osc.start(); osc.stop(ctx.currentTime + 0.3);
+                setTimeout(() => { osc.frequency.value = signal.direction === 'BUY' ? 1100 : 440; }, 150);
+            } catch(e) {}
+            
+            setTimeout(() => el.classList.add('hidden'), 30000);
+        }
+
+        // ─── Socket Events ───
+        socket.on('connect', () => {
+            connected = true;
+            document.getElementById('status').innerHTML = '<span class="text-green-400 pulse">● CONNECTED</span>';
+            log('Connected to UTS Pro server', 'system');
+        });
+
+        socket.on('disconnect', (reason) => {
+            connected = false;
+            document.getElementById('status').innerHTML = '<span class="text-red-400">● DISCONNECTED</span>';
+            log(`Disconnected: ${reason}`, 'error');
+        });
+
+        socket.on('reconnect', (attempt) => {
+            log(`Reconnected after ${attempt} attempts`, 'system');
+        });
+
+        socket.on('reconnect_attempt', (attempt) => {
+            document.getElementById('status').innerHTML = `<span class="text-yellow-400 pulse">● Reconnecting (${attempt})...</span>`;
+        });
+
+        socket.on('initial_state', (d) => {
+            log('Received initial state from server', 'system');
+            
+            prices = d.prices || {};
+            
+            // Convert signals
+            signals = {};
+            if (d.signals) {
+                for (const [k, v] of Object.entries(d.signals)) {
+                    signals[k] = v;
+                }
+            }
+            
+            history = d.history || [];
+            
+            document.getElementById('scanCount').textContent = d.scan_count || 0;
+            document.getElementById('lastScan').textContent = d.last_scan || '--:--';
+            document.getElementById('scannerStatus').textContent = d.scanner_status || 'RUNNING';
+            
+            if (d.stats) {
+                document.getElementById('buyCount').textContent = d.stats.total_buy || 0;
+                document.getElementById('sellCount').textContent = d.stats.total_sell || 0;
+            }
+            
+            renderPrices();
+            renderSignals();
+            renderHistory();
+            
+            const priceCount = Object.keys(prices).length;
+            const sigCount = Object.keys(signals).length;
+            log(`State loaded: ${priceCount} prices, ${sigCount} active signals, ${history.length} history`, 'info');
+        });
+
+        socket.on('price_update', (d) => {
+            if (!d || !d.symbol) return;
+            
+            prices[d.symbol] = d.data;
+            if (d.analysis) {
+                analysisData[d.symbol] = d.analysis;
+            }
+            
+            renderPrices();
+            renderConfluence();
+            renderTechSummary();
+            
+            // Log only every few updates per symbol
+            const now = Date.now();
+            if (!lastPriceUpdate[d.symbol] || now - lastPriceUpdate[d.symbol] > 30000) {
+                log(`${d.symbol}: $${d.data.price} | Buy:${d.analysis?.buy_score || 0}/15 Sell:${d.analysis?.sell_score || 0}/15`, 'price');
+                lastPriceUpdate[d.symbol] = now;
+            }
+        });
+
+        socket.on('new_signal', (d) => {
+            if (!d || !d.signal) return;
+            
+            signals[d.symbol] = d.signal;
+            history.unshift(d.signal);
+            history = history.slice(0, 100);
+            
+            renderSignals();
+            renderHistory();
+            showAlert(d.signal);
+            
+            log(`🎯 NEW SIGNAL: ${d.symbol} ${d.signal.direction} @ $${d.signal.entry_price} | Score: ${d.signal.confluence_score}/15 | R:R: ${d.signal.risk_reward}:1`, 'signal');
+        });
+
+        socket.on('scan_update', (d) => {
+            if (!d) return;
+            document.getElementById('scanCount').textContent = d.scan_count || 0;
+            document.getElementById('lastScan').textContent = d.last_scan || '--:--';
+            document.getElementById('scannerStatus').textContent = d.scanner_status || 'RUNNING';
+            
+            if (d.stats) {
+                document.getElementById('buyCount').textContent = d.stats.total_buy || 0;
+                document.getElementById('sellCount').textContent = d.stats.total_sell || 0;
+            }
+            
+            // Flash scanner badge
+            const badge = document.getElementById('scannerBadge');
+            badge.classList.remove('hidden');
+            badge.textContent = `Scan #${d.scan_count} (${d.symbols_ok || 0}/${(d.symbols_ok || 0) + (d.symbols_fail || 0)})`;
+            setTimeout(() => badge.classList.add('hidden'), 5000);
+        });
+
+        socket.on('scanner_status', (d) => {
+            if (d && d.status) {
+                document.getElementById('scannerStatus').textContent = d.status;
+                if (d.message) log(d.message, 'warn');
+            }
+        });
+
+        // ─── Periodic health check ───
+        setInterval(() => {
+            if (!connected) {
+                log('Connection lost - attempting reconnect...', 'warn');
+            }
+        }, 30000);
+    </script>
+</body></html>
+'''
+
+ADMIN_TEMPLATE = '''
+<!DOCTYPE html>
+<html><head>
+    <meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>👑 UTS Pro Admin</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-900 min-h-screen text-white">
+    <div class="container mx-auto px-4 py-8 max-w-4xl">
+        <div class="flex justify-between items-center mb-8">
+            <h1 class="text-2xl font-bold">👑 Admin Panel</h1>
+            <div class="flex gap-4">
+                <a href="/dashboard" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg">📊 Dashboard</a>
+                <a href="/logout" class="px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg">🚪 Logout</a>
+            </div>
+        </div>
+        
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}{% for cat, msg in messages %}
+        <div class="mb-4 p-4 rounded-lg {% if cat == 'error' %}bg-red-900 text-red-200{% else %}bg-green-900 text-green-200{% endif %}">{{ msg }}</div>
+        {% endfor %}{% endif %}{% endwith %}
+        
+        <!-- System Status -->
+        <div class="bg-gray-800 rounded-xl p-6 mb-6">
+            <h2 class="text-xl font-bold mb-4">📊 System Status</h2>
+            <div class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <div><span class="text-gray-400">Scans:</span> <span class="font-bold">{{ scan_count }}</span></div>
+                <div><span class="text-gray-400">Last Scan:</span> <span class="font-mono">{{ last_scan }}</span></div>
+                <div><span class="text-gray-400">Active Signals:</span> <span class="font-bold text-green-400">{{ active_signals }}</span></div>
+                <div><span class="text-gray-400">Scanner:</span> <span class="text-blue-400">{{ scanner_status }}</span></div>
+            </div>
+            {% if errors %}
+            <div class="mt-4">
+                <h3 class="text-sm font-bold text-red-400 mb-2">Recent Errors:</h3>
+                <div class="bg-gray-900 rounded p-3 max-h-40 overflow-y-auto text-xs font-mono">
+                    {% for err in errors[:10] %}<div class="text-red-300">{{ err }}</div>{% endfor %}
+                </div>
+            </div>
+            {% endif %}
+        </div>
+        
+        <!-- Create User -->
+        <div class="bg-gray-800 rounded-xl p-6 mb-6">
+            <h2 class="text-xl font-bold mb-4">➕ Create User</h2>
+            <form method="POST" action="/admin/create" class="grid grid-cols-1 md:grid-cols-5 gap-4">
+                <input type="text" name="username" placeholder="Username" required class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white">
+                <input type="password" name="password" placeholder="Password (min 6)" required class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white">
+                <input type="text" name="name" placeholder="Display Name" required class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white">
+                <select name="role" class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg text-white">
+                    <option value="user">User</option><option value="admin">Admin</option>
+                </select>
+                <button type="submit" class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg font-bold">✅ Create</button>
+            </form>
+        </div>
+        
+        <!-- Users Table -->
+        <div class="bg-gray-800 rounded-xl overflow-hidden">
+            <h2 class="text-xl font-bold p-6 border-b border-gray-700">👥 Users</h2>
+            <table class="w-full">
+                <thead class="bg-gray-700"><tr>
+                    <th class="px-6 py-3 text-left">Username</th>
+                    <th class="px-6 py-3 text-left">Name</th>
+                    <th class="px-6 py-3 text-left">Role</th>
+                    <th class="px-6 py-3 text-left">Status</th>
+                    <th class="px-6 py-3 text-left">Last Login</th>
+                    <th class="px-6 py-3 text-left">Actions</th>
+                </tr></thead>
+                <tbody>
+                {% for username, user in users.items() %}
+                <tr class="border-t border-gray-700">
+                    <td class="px-6 py-4 font-bold">{{ username }}</td>
+                    <td class="px-6 py-4">{{ user.name }}</td>
+                    <td class="px-6 py-4"><span class="px-2 py-1 rounded text-sm {% if user.role == 'admin' %}bg-yellow-600{% else %}bg-blue-600{% endif %}">{{ user.role }}</span></td>
+                    <td class="px-6 py-4"><span class="px-2 py-1 rounded text-sm {% if user.active %}bg-green-600{% else %}bg-red-600{% endif %}">{{ 'Active' if user.active else 'Disabled' }}</span></td>
+                    <td class="px-6 py-4 text-xs text-gray-400">{{ user.last_login or 'Never' }}</td>
+                    <td class="px-6 py-4">
+                        {% if username != 'admin' %}
+                        <form method="POST" action="/admin/toggle/{{ username }}" class="inline">
+                            <button class="px-3 py-1 {% if user.active %}bg-orange-600{% else %}bg-green-600{% endif %} rounded text-sm hover:opacity-80">{{ '🔒 Disable' if user.active else '🔓 Enable' }}</button>
+                        </form>
+                        <form method="POST" action="/admin/delete/{{ username }}" class="inline ml-2" onsubmit="return confirm('Delete user {{ username }}?')">
+                            <button class="px-3 py-1 bg-red-600 rounded text-sm hover:opacity-80">🗑️ Delete</button>
+                        </form>
+                        {% else %}
+                        <span class="text-gray-500 text-sm">Protected</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</body></html>
+'''
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # ROUTES
 # ═══════════════════════════════════════════════════════════════════════════════
 @app.route('/')
 def index():
-    return redirect(url_for('dashboard') if 'user' in session else url_for('login'))
+    return redirect(url_for('login') if 'user' not in session else url_for('dashboard'))
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if 'user' in session:
         return redirect(url_for('dashboard'))
     if request.method == 'POST':
-        u = request.form.get('username', '').strip().lower()
-        p = request.form.get('password', '')
-        if user_manager.verify_password(u, p):
+        username = request.form.get('username', '').strip().lower()
+        password = request.form.get('password', '')
+        if user_manager.verify(username, password):
             session.permanent = True
-            session['user'] = u
-            user_manager.update_last_login(u)
-            flash('Login successful!', 'success')
+            session['user'] = username
+            user_manager.users[username]['last_login'] = format_datetime()
+            user_manager.save_users()
             return redirect(url_for('dashboard'))
         flash('Invalid credentials', 'error')
     return render_template_string(LOGIN_TEMPLATE)
 
 @app.route('/logout')
 def logout():
-    if 'user' in session:
-        for sid, u in list(store.online_users.items()):
-            if u == session['user']:
-                del store.online_users[sid]
     session.clear()
-    flash('Logged out', 'success')
     return redirect(url_for('login'))
 
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    u = user_manager.get_user(session['user'])
+    user = user_manager.users.get(session['user'], {})
     return render_template_string(DASHBOARD_TEMPLATE, 
-        user_name=u.get('name', session['user']), 
-        is_admin=u.get('role') == 'admin')
+                                  is_admin=user.get('role') == 'admin',
+                                  username=user.get('name', session['user']))
 
 @app.route('/admin')
 @admin_required
 def admin():
     return render_template_string(ADMIN_TEMPLATE, 
-        users=user_manager.get_all_users(), 
-        online_users=store.online_users)
+                                  users=user_manager.get_all_users(),
+                                  scan_count=store.scan_count,
+                                  last_scan=store.last_scan,
+                                  active_signals=len(store.signals),
+                                  scanner_status=store.scanner_status,
+                                  errors=store.errors)
 
-@app.route('/admin/create-user', methods=['POST'])
+@app.route('/admin/create', methods=['POST'])
 @admin_required
 def admin_create_user():
-    ok, msg = user_manager.create_user(
+    success, msg = user_manager.create_user(
         request.form.get('username', '').strip().lower(),
         request.form.get('password', ''),
         request.form.get('name', '').strip(),
         request.form.get('role', 'user')
     )
-    flash(msg, 'success' if ok else 'error')
+    flash(msg, 'success' if success else 'error')
     return redirect(url_for('admin'))
 
-@app.route('/admin/toggle-user/<username>', methods=['POST'])
+@app.route('/admin/toggle/<username>', methods=['POST'])
 @admin_required
-def admin_toggle_user(username):
-    u = user_manager.get_user(username)
-    if u:
-        user_manager.update_user(username, {'active': not u.get('active', True)})
+def admin_toggle(username):
+    if username in user_manager.users and username != 'admin':
+        user_manager.users[username]['active'] = not user_manager.users[username].get('active', True)
+        user_manager.save_users()
     return redirect(url_for('admin'))
 
-@app.route('/admin/delete-user/<username>', methods=['POST'])
+@app.route('/admin/delete/<username>', methods=['POST'])
 @admin_required
-def admin_delete_user(username):
-    user_manager.delete_user(username)
-    return redirect(url_for('admin'))
-
-@app.route('/admin/change-password', methods=['POST'])
-@admin_required
-def admin_change_password():
-    p = request.form.get('new_password', '')
-    if len(p) >= 6:
-        user_manager.update_user('admin', {'password': p})
-        flash('Changed', 'success')
-    else:
-        flash('Min 6 chars', 'error')
+def admin_delete(username):
+    if username in user_manager.users and username != 'admin':
+        del user_manager.users[username]
+        user_manager.save_users()
     return redirect(url_for('admin'))
 
 @app.route('/health')
 def health():
     return {
         'status': 'ok',
-        'time': format_bangkok_datetime(),
-        'version': 'UTS Pro 4.0',
-        'scanner_running': scanner_running,
-        'scan_count': store.scan_count,
+        'time': format_datetime(),
+        'scans': store.scan_count,
         'last_scan': store.last_scan,
-        'prices_count': len(store.prices),
-        'signals_count': len(store.signals),
-        'errors': store.errors[-3:]
+        'scanner': store.scanner_status,
+        'prices': {s: p.get('price', 0) for s, p in store.prices.items()},
+        'signals': len(store.signals),
+        'connected_clients': store.connected_clients,
+        'errors': store.errors[:5]
     }
 
-@app.route('/debug')
-def debug():
-    """Debug endpoint to check system status"""
-    return jsonify({
-        'time': format_bangkok_datetime(),
-        'scanner_running': scanner_running,
-        'scan_count': store.scan_count,
-        'last_scan': store.last_scan,
-        'prices': store.prices,
-        'signals_count': len(store.signals),
-        'history_count': len(store.history),
-        'connected_clients': store.connected_clients,
-        'errors': store.errors
-    })
-
+# ═══════════════════════════════════════════════════════════════════════════════
+# WEBSOCKET EVENTS
+# ═══════════════════════════════════════════════════════════════════════════════
 @socketio.on('connect')
 def handle_connect():
     store.connected_clients += 1
-    if 'user' in session:
-        store.online_users[request.sid] = session['user']
+    logger.info(f"Client connected (total: {store.connected_clients})")
     
-    print(f"[{format_bangkok_time()}] ✅ Client connected ({store.connected_clients} total)")
-    
+    # Send initial state
     emit('initial_state', {
         'prices': store.prices,
         'signals': {k: asdict(v) for k, v in store.signals.items()},
-        'history': [asdict(s) for s in store.history[:20]],
+        'history': [asdict(s) for s in store.history[:30]],
         'scan_count': store.scan_count,
         'last_scan': store.last_scan,
-        'stats': {
-            'total_buy': store.total_buy_signals,
-            'total_sell': store.total_sell_signals
-        }
+        'scanner_status': store.scanner_status,
+        'stats': store.stats
     })
 
 @socketio.on('disconnect')
 def handle_disconnect():
     store.connected_clients = max(0, store.connected_clients - 1)
-    if request.sid in store.online_users:
-        del store.online_users[request.sid]
-    print(f"[{format_bangkok_time()}] ❌ Client disconnected ({store.connected_clients} remaining)")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# TEMPLATES
-# ═══════════════════════════════════════════════════════════════════════════════
-LOGIN_TEMPLATE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>🔐 UTS Pro v4</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-gray-900 min-h-screen flex items-center justify-center"><div class="bg-gray-800 p-8 rounded-2xl shadow-2xl w-full max-w-md border border-yellow-500/30"><div class="text-center mb-8"><div class="text-5xl mb-4">⚡</div><h1 class="text-2xl font-bold text-yellow-400">UTS Pro v4.0</h1><p class="text-gray-400">Ultimate Trading System</p></div>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}{% for category, message in messages %}<div class="mb-4 p-3 rounded-lg {% if category == 'error' %}bg-red-900 text-red-200{% else %}bg-green-900 text-green-200{% endif %}">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}<form method="POST" class="space-y-6"><div><label class="block text-gray-300 text-sm font-medium mb-2">Username</label><input type="text" name="username" required class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-yellow-500" placeholder="Enter username"></div><div><label class="block text-gray-300 text-sm font-medium mb-2">Password</label><input type="password" name="password" required class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:outline-none focus:border-yellow-500" placeholder="Enter password"></div><button type="submit" class="w-full py-3 bg-yellow-600 hover:bg-yellow-700 text-black font-bold rounded-lg transition">🔓 Login</button></form><div class="mt-6 text-center text-gray-500 text-sm"><p>Default: admin / admin123</p></div></div></body></html>'''
-
-ADMIN_TEMPLATE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>👑 Admin - UTS Pro</title><script src="https://cdn.tailwindcss.com"></script></head><body class="bg-gray-900 min-h-screen text-white"><div class="container mx-auto px-4 py-8 max-w-6xl"><div class="flex justify-between items-center mb-8"><div><h1 class="text-3xl font-bold text-yellow-400">👑 Admin Panel</h1><p class="text-gray-400">UTS Pro v4.0</p></div><div class="flex gap-4"><a href="{{ url_for('dashboard') }}" class="px-4 py-2 bg-blue-600 hover:bg-blue-700 rounded-lg">📊 Dashboard</a><a href="{{ url_for('logout') }}" class="px-4 py-2 bg-red-600 hover:bg-red-700 rounded-lg">🚪 Logout</a></div></div>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}{% for category, message in messages %}<div class="mb-4 p-4 rounded-lg {% if category == 'error' %}bg-red-900{% else %}bg-green-900{% endif %}">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}<div class="bg-gray-800 rounded-xl p-6 mb-8 border border-gray-700"><h2 class="text-xl font-bold mb-4 text-yellow-400">➕ Create User</h2><form method="POST" action="{{ url_for('admin_create_user') }}" class="grid grid-cols-1 md:grid-cols-5 gap-4"><input type="text" name="username" placeholder="Username" required class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg"><input type="password" name="password" placeholder="Password" required class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg"><input type="text" name="name" placeholder="Name" required class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg"><select name="role" class="px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg"><option value="user">User</option><option value="admin">Admin</option></select><button type="submit" class="px-4 py-2 bg-green-600 hover:bg-green-700 rounded-lg font-bold">✅ Create</button></form></div><div class="bg-gray-800 rounded-xl overflow-hidden border border-gray-700 mb-8"><table class="w-full"><thead class="bg-gray-700"><tr><th class="px-6 py-3 text-left">User</th><th class="px-6 py-3 text-left">Name</th><th class="px-6 py-3 text-left">Role</th><th class="px-6 py-3 text-left">Status</th><th class="px-6 py-3 text-left">Actions</th></tr></thead><tbody>{% for username, user in users.items() %}<tr class="border-t border-gray-700"><td class="px-6 py-4 font-bold">{{ username }}</td><td class="px-6 py-4">{{ user.name }}</td><td class="px-6 py-4"><span class="px-2 py-1 rounded text-sm {% if user.role == 'admin' %}bg-yellow-600{% else %}bg-blue-600{% endif %}">{{ user.role }}</span></td><td class="px-6 py-4"><span class="px-2 py-1 rounded text-sm {% if user.active %}bg-green-600{% else %}bg-red-600{% endif %}">{{ 'Active' if user.active else 'Inactive' }}</span></td><td class="px-6 py-4">{% if username != 'admin' %}<form method="POST" action="{{ url_for('admin_toggle_user', username=username) }}" class="inline"><button type="submit" class="px-3 py-1 {% if user.active %}bg-orange-600{% else %}bg-green-600{% endif %} rounded text-sm">Toggle</button></form><form method="POST" action="{{ url_for('admin_delete_user', username=username) }}" class="inline ml-2"><button type="submit" class="px-3 py-1 bg-red-600 rounded text-sm">🗑️</button></form>{% endif %}</td></tr>{% endfor %}</tbody></table></div><div class="bg-gray-800 rounded-xl p-6 border border-gray-700"><h2 class="text-xl font-bold mb-4 text-yellow-400">🔑 Change Password</h2><form method="POST" action="{{ url_for('admin_change_password') }}" class="flex gap-4"><input type="password" name="new_password" placeholder="New Password" required minlength="6" class="flex-1 px-4 py-2 bg-gray-700 border border-gray-600 rounded-lg"><button type="submit" class="px-6 py-2 bg-yellow-600 hover:bg-yellow-700 rounded-lg font-bold text-black">🔄 Change</button></form></div></div></body></html>'''
-
-DASHBOARD_TEMPLATE = '''<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>⚡ UTS Pro v4.0</title><script src="https://cdn.tailwindcss.com"></script><script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.0.1/socket.io.js"></script><style>@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}.pulse{animation:pulse 1s infinite}@keyframes glow{0%,100%{box-shadow:0 0 5px #ffd700}50%{box-shadow:0 0 20px #ffd700}}.glow{animation:glow 1.5s infinite}</style></head><body class="bg-gray-900 text-white min-h-screen"><div class="container mx-auto px-4 py-6 max-w-7xl"><div class="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 gap-4"><div><h1 class="text-2xl md:text-3xl font-bold"><span class="text-yellow-400">⚡ UTS Pro</span> <span class="text-gray-400">v4.0</span></h1><p class="text-gray-400 text-sm">Welcome, <span class="text-yellow-400 font-bold">{{ user_name }}</span></p></div><div class="flex items-center gap-4 flex-wrap"><div id="clock" class="bg-gray-800 px-4 py-2 rounded-lg font-mono text-lg border border-yellow-500/30">--:--:--</div><span id="status" class="text-red-400">● Connecting...</span>{% if is_admin %}<a href="{{ url_for('admin') }}" class="px-3 py-2 bg-yellow-600 hover:bg-yellow-700 rounded-lg text-sm text-black font-bold">👑 Admin</a>{% endif %}<a href="{{ url_for('logout') }}" class="px-3 py-2 bg-red-600 hover:bg-red-700 rounded-lg text-sm">🚪</a></div></div><div class="grid grid-cols-2 md:grid-cols-6 gap-3 mb-6"><div class="bg-gray-800 rounded-lg p-3 text-center border border-gray-700"><div class="text-gray-400 text-xs">Scans</div><div id="scanCount" class="text-xl font-bold text-yellow-400">0</div></div><div class="bg-gray-800 rounded-lg p-3 text-center border border-gray-700"><div class="text-gray-400 text-xs">Signals</div><div id="signalCount" class="text-xl font-bold text-green-400">0</div></div><div class="bg-gray-800 rounded-lg p-3 text-center border border-gray-700"><div class="text-gray-400 text-xs">Last Scan</div><div id="lastScan" class="text-lg font-mono">--:--</div></div><div class="bg-gray-800 rounded-lg p-3 text-center border border-gray-700"><div class="text-gray-400 text-xs">Session</div><div id="session" class="text-sm font-bold text-yellow-400">-</div></div><div class="bg-gray-800 rounded-lg p-3 text-center border border-gray-700"><div class="text-gray-400 text-xs">Buy Signals</div><div id="buyCount" class="text-xl font-bold text-green-400">0</div></div><div class="bg-gray-800 rounded-lg p-3 text-center border border-gray-700"><div class="text-gray-400 text-xs">Sell Signals</div><div id="sellCount" class="text-xl font-bold text-red-400">0</div></div></div><div id="alertArea" class="hidden mb-6"><div class="bg-gradient-to-r from-yellow-900/50 to-yellow-800/50 border-2 border-yellow-500 rounded-xl p-4 glow"><div class="flex items-center gap-3"><span class="text-4xl">🚨</span><div><div id="alertTitle" class="text-xl font-bold text-yellow-400">NEW SIGNAL!</div><div id="alertText" class="text-yellow-200"></div></div></div></div></div><h2 class="text-lg font-bold mb-3 text-yellow-400">💰 Live Prices <span class="text-xs text-green-400 pulse">● LIVE</span></h2><div id="prices" class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6"></div><h2 class="text-lg font-bold mb-3 text-yellow-400">🎯 Active Signals</h2><div id="signals" class="grid grid-cols-1 xl:grid-cols-2 gap-4 mb-6"><div class="bg-gray-800 rounded-xl p-8 text-center text-gray-400 col-span-full border border-gray-700"><div class="text-4xl mb-2">📡</div><div>Scanning for signals...</div></div></div><h2 class="text-lg font-bold mb-3 text-yellow-400">📜 History</h2><div class="bg-gray-800 rounded-xl overflow-hidden mb-6 border border-gray-700"><div class="overflow-x-auto"><table class="w-full text-sm"><thead class="bg-gray-700"><tr><th class="px-3 py-2 text-left">Time</th><th class="px-3 py-2 text-left">Symbol</th><th class="px-3 py-2 text-left">Dir</th><th class="px-3 py-2 text-left">Entry</th><th class="px-3 py-2 text-left">SL</th><th class="px-3 py-2 text-left">TP1</th><th class="px-3 py-2 text-left">R:R</th><th class="px-3 py-2 text-left">Score</th></tr></thead><tbody id="history"></tbody></table></div></div><div id="log" class="bg-gray-800 rounded-xl p-4 h-32 overflow-y-auto font-mono text-xs border border-gray-700"></div></div><script>const socket=io();let prices={},signals={},history=[],stats={};function updateClock(){const d=new Date(new Date().toLocaleString("en-US",{timeZone:"Asia/Bangkok"}));document.getElementById('clock').textContent='TH '+d.toLocaleTimeString('en-GB');const h=d.getUTCHours();let s='OFF-PEAK';if(h>=8&&h<10)s='LONDON-KZ ⭐⭐';else if(h>=14&&h<16)s='NY-KZ ⭐⭐';else if(h>=8&&h<16)s='LONDON ⭐';else if(h>=13&&h<22)s='NEW YORK';else if(h<9)s='ASIAN';document.getElementById('session').textContent=s}setInterval(updateClock,1000);updateClock();function log(m,t='info'){const el=document.getElementById('log');const tm=new Date().toLocaleTimeString('en-GB',{timeZone:'Asia/Bangkok'});const c={signal:'text-green-400',error:'text-red-400'}[t]||'text-gray-400';el.innerHTML=`<div class="${c}">[${tm}] ${m}</div>`+el.innerHTML}function renderPrices(){const syms={XAUUSD:'🥇 GOLD',XAGUSD:'🥈 SILVER',USOUSD:'🛢️ OIL'};let h='';for(const[s,n]of Object.entries(syms)){const p=prices[s];if(!p){h+=`<div class="bg-gray-800 rounded-xl p-4 text-gray-400 border border-gray-700">${n} - Loading...</div>`;continue}const c=p.change>=0?'text-green-400':'text-red-400';h+=`<div class="bg-gray-800 rounded-xl p-4 border border-gray-700"><div class="flex justify-between mb-2"><span class="font-bold">${n}</span><span class="${c}">${p.change>=0?'▲':'▼'} ${p.change_pct.toFixed(3)}%</span></div><div class="text-3xl font-bold">$${p.price.toLocaleString()}</div><div class="flex justify-between text-xs text-gray-400 mt-2"><span>H: $${p.high}</span><span>L: $${p.low}</span></div><div class="text-xs text-gray-500 mt-1">${p.time} ${p.cached?'(cached)':''}</div></div>`}document.getElementById('prices').innerHTML=h}function renderSignals(){const list=Object.values(signals);if(!list.length){document.getElementById('signals').innerHTML=`<div class="bg-gray-800 rounded-xl p-8 text-center text-gray-400 col-span-full border border-gray-700"><div class="text-4xl mb-2">📡</div><div>Scanning for signals...</div></div>`;document.getElementById('signalCount').textContent='0';return}let h='';for(const s of list){const buy=s.direction==='BUY';const gc=buy?'from-green-900/30':'from-red-900/30';const bc=buy?'border-green-500':'border-red-500';const dc=buy?'text-green-400':'text-red-400';h+=`<div class="bg-gradient-to-br ${gc} to-gray-800 rounded-xl p-5 border-l-4 ${bc}"><div class="flex justify-between mb-4"><div><div class="text-2xl font-bold ${dc}">${buy?'🟢':'🔴'} ${s.symbol} ${s.direction}</div><div class="text-sm text-gray-400">${s.session} • ${s.market_structure}</div></div><div class="text-right"><span class="bg-yellow-600/80 px-3 py-1 rounded-full text-sm text-black font-bold">${s.strength}</span><div class="text-xs text-gray-400 mt-1">${s.timestamp}</div></div></div><div class="grid grid-cols-2 gap-3 mb-4"><div class="bg-gray-900/50 rounded-lg p-3"><div class="text-xs text-gray-400">Entry</div><div class="text-xl font-bold text-yellow-400">$${s.entry_price}</div></div><div class="bg-red-900/30 rounded-lg p-3 border border-red-900"><div class="text-xs text-red-400">Stop Loss</div><div class="text-xl font-bold text-red-400">$${s.stop_loss}</div><div class="text-xs text-gray-500">Risk: $${s.risk_dollars}</div></div></div><div class="grid grid-cols-3 gap-2 mb-4"><div class="bg-green-900/30 rounded-lg p-2 border border-green-900 text-center"><div class="text-xs text-green-400">TP1</div><div class="font-bold text-green-400">$${s.tp1}</div></div><div class="bg-green-900/40 rounded-lg p-2 border border-green-700 text-center"><div class="text-xs text-green-300">TP2</div><div class="font-bold text-green-300">$${s.tp2}</div></div><div class="bg-green-900/50 rounded-lg p-2 border border-green-500 text-center"><div class="text-xs text-green-200">TP3</div><div class="font-bold text-green-200">$${s.tp3}</div></div></div><div class="mb-3"><div class="flex justify-between text-xs mb-1"><span>Confluence Score</span><span>${s.confluence_score}/10 | R:R ${s.risk_reward}:1</span></div><div class="bg-gray-700 rounded-full h-2"><div class="bg-yellow-500 h-2 rounded-full" style="width:${Math.min(s.confluence_score*10,100)}%"></div></div></div><div class="flex flex-wrap gap-1">${s.reasons.map(r=>`<span class="bg-gray-700 px-2 py-1 rounded text-xs">${r}</span>`).join('')}</div></div>`}document.getElementById('signals').innerHTML=h;document.getElementById('signalCount').textContent=list.length}function renderHistory(){if(!history.length){document.getElementById('history').innerHTML='<tr><td colspan="8" class="px-3 py-4 text-center text-gray-400">No signals yet...</td></tr>';return}document.getElementById('history').innerHTML=history.slice(0,10).map(s=>`<tr class="border-t border-gray-700"><td class="px-3 py-2 text-xs">${s.timestamp}</td><td class="px-3 py-2 font-bold">${s.symbol}</td><td class="px-3 py-2"><span class="${s.direction==='BUY'?'text-green-400 bg-green-900/30':'text-red-400 bg-red-900/30'} px-2 py-1 rounded">${s.direction}</span></td><td class="px-3 py-2 text-yellow-400">$${s.entry_price}</td><td class="px-3 py-2 text-red-400">$${s.stop_loss}</td><td class="px-3 py-2 text-green-400">$${s.tp1}</td><td class="px-3 py-2 font-bold">${s.risk_reward}:1</td><td class="px-3 py-2">${s.confluence_score}</td></tr>`).join('')}function updateStats(d){if(!d)return;document.getElementById('buyCount').textContent=d.total_buy||0;document.getElementById('sellCount').textContent=d.total_sell||0}function showAlert(s){document.getElementById('alertTitle').textContent=`NEW ${s.direction} SIGNAL!`;document.getElementById('alertText').textContent=`${s.symbol} @ $${s.entry_price} | Score: ${s.confluence_score}`;document.getElementById('alertArea').classList.remove('hidden');try{const ctx=new AudioContext();const o=ctx.createOscillator();const g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.frequency.value=s.direction==='BUY'?800:600;g.gain.value=0.1;o.start();o.stop(ctx.currentTime+0.2)}catch(e){}setTimeout(()=>document.getElementById('alertArea').classList.add('hidden'),15000)}socket.on('connect',()=>{document.getElementById('status').innerHTML='<span class="text-green-400 pulse">● CONNECTED</span>';log('Connected to UTS Pro server','signal')});socket.on('disconnect',()=>{document.getElementById('status').innerHTML='<span class="text-red-400">● DISCONNECTED</span>';log('Disconnected','error')});socket.on('initial_state',(d)=>{prices=d.prices||{};signals=d.signals||{};history=d.history||[];stats=d.stats||{};document.getElementById('scanCount').textContent=d.scan_count;document.getElementById('lastScan').textContent=d.last_scan;renderPrices();renderSignals();renderHistory();updateStats(stats);log('Initial state received','signal')});socket.on('price_update',(d)=>{prices[d.symbol]=d.data;renderPrices();log(`Price update: ${d.symbol} $${d.data.price}`)});socket.on('new_signal',(d)=>{signals[d.symbol]=d.signal;history.unshift(d.signal);renderSignals();renderHistory();showAlert(d.signal);log(`🎯 NEW SIGNAL: ${d.symbol} ${d.signal.direction} @ $${d.signal.entry_price}`,'signal')});socket.on('scan_update',(d)=>{document.getElementById('scanCount').textContent=d.scan_count;document.getElementById('lastScan').textContent=d.last_scan;if(d.stats)updateStats(d.stats);log(`Scan #${d.scan_count} complete`)})</script></body></html>'''
+    logger.info(f"Client disconnected (total: {store.connected_clients})")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
-    print("="*60)
-    print(" ⚡ ULTIMATE TRADING SYSTEM PRO v4.0 - FIXED")
-    print("="*60)
-    print(f"Time: {format_bangkok_datetime()}")
-    print("Default: admin / admin123")
-    print("="*60)
+    print("=" * 60)
+    print(" ⚡ UTS PRO v4 - Ultimate Trading System (FIXED)")
+    print(" Real-time Market Analysis Dashboard")
+    print("=" * 60)
+    print(f" Time: {format_datetime()}")
+    print(f" Features: SMC, Multi-TF S/R, Supply/Demand, Market Maker, FVG")
+    print(f" Min Confluence: {Config.MIN_CONFLUENCE_SCORE}/15")
+    print(f" Min R:R: {Config.MIN_RR_RATIO}:1")
+    print(f" Scan Interval: {Config.SCAN_INTERVAL}s")
+    print(f" Symbols: {', '.join(Config.SYMBOLS.keys())}")
+    print(f" Default login: admin / admin123")
+    print("=" * 60)
     
-    # Start scanner thread
-    scanner_thread = threading.Thread(target=background_scanner, daemon=True)
-    scanner_thread.start()
-    print("✅ Scanner thread started")
+    # Start scanner in background using eventlet
+    eventlet.spawn(background_scanner)
     
     port = int(os.environ.get('PORT', 8000))
-    print(f"\n🌐 Running on port {port}")
-    print(f"📊 Debug endpoint: /debug")
-    print(f"❤️ Health endpoint: /health")
+    print(f"\n🌐 Starting on port {port}...")
     
-    socketio.run(app, host='0.0.0.0', port=port, debug=False)
+    socketio.run(app, host='0.0.0.0', port=port, debug=False, use_reloader=False)
