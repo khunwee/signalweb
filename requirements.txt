@@ -1,8 +1,11 @@
+
 flask==3.0.0
 flask-socketio==5.3.6
-yfinance==0.2.36
-pandas==2.1.4
+yfinance==0.2.40
+pandas==2.0.3
+numpy==1.24.3
 python-engineio==4.8.1
 python-socketio==5.10.0
-eventlet==0.35.1
+eventlet==0.33.3
 gunicorn==21.2.0
+dnspython==2.4.2
