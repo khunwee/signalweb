@@ -1034,7 +1034,7 @@ LOGIN_TEMPLATE = '''
             <input type="password" name="password" required class="w-full px-4 py-3 bg-gray-700 border border-gray-600 rounded-lg text-white focus:border-yellow-500 focus:outline-none"></div>
             <button type="submit" class="w-full py-3 bg-yellow-600 hover:bg-yellow-700 text-white font-bold rounded-lg transition">🔓 Login</button>
         </form>
-        <p class="mt-4 text-center text-gray-500 text-sm">Default: admin / admin123</p>
+        <p class="mt-4 text-center text-gray-500 text-sm">Developed by Weerapong Saengloothong (Wee)</p>
     </div>
 </body></html>
 '''
@@ -1482,3 +1482,4 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     print(f"\n🌐 Starting on port {port}...")
     socketio.run(app, host='0.0.0.0', port=port, debug=False, use_reloader=False)
+
